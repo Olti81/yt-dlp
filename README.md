@@ -25,11 +25,18 @@ offers what it has, instead of a fixed list that silently falls back.
 automatically, in order, as soon as the current one finishes. Reorder, remove, retry failed
 items, or cancel the running download. The queue survives restarts.
 
+**Play/pause on every row.** One download runs at a time by default, but the control in the
+first column of each row overrides that: press play on a queued item to run it alongside the
+current one, or pause a running one. Pausing stops yt-dlp and keeps the partial file, so
+pressing play again continues from where it stopped instead of starting over. Raise
+*Downloads at the same time* in Settings if you would rather several always run at once.
+
 **Playlists and batches.** A playlist URL can be expanded into one queue entry per video, or
 kept as a single entry. Paste several URLs at once, one per line, to queue them together.
 
 **Live progress.** Per-item and whole-queue progress bars with real speed, ETA and size,
-read from yt-dlp's structured progress output rather than scraped from its console text. The
+read from yt-dlp's structured progress output rather than scraped from its console text.
+With several downloads at once the top bar shows their average and combined throughput. The
 window title shows the current percentage, so it is readable from the taskbar.
 
 **Formats.** MP4 / MKV / WEBM video, or MP3 / M4A / WAV / FLAC / Opus audio with a selectable
@@ -100,3 +107,10 @@ your `PATH`. The app checks at startup and warns if none is found.
 **Impersonation.** Requests are sent as Chrome by default, which helps with sites that block
 plain HTTP clients. If that is rejected, the download is retried once without it
 automatically. It can be turned off in **Settings**.
+
+**How pause really works.** There is no way to freeze a running download and hold the
+connection open, so pause stops yt-dlp and leaves the `.part` file in place; play restarts
+yt-dlp, which continues from that file. For ordinary progressive downloads this resumes to
+the byte. For fragmented streams (HLS/DASH) it resumes at the last completed fragment, so a
+little of the current fragment is re-fetched. A few sites issue single-use URLs and will
+restart the file instead — rare, but worth knowing.

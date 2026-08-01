@@ -57,25 +57,33 @@ AUDIO_QUALITIES = ["Best available", "320 kbps", "256 kbps", "192 kbps", "128 kb
 
 # Queue columns. Widths are shared out by weight on every resize so the table
 # always fits the window, whatever the display scaling is.
-TREE_COLUMNS = ("title", "kind", "quality", "status", "progress", "size", "speed", "eta")
+TREE_COLUMNS = ("act", "title", "kind", "quality", "status", "progress", "size", "speed", "eta")
 COLUMN_SPEC = {
-    "title":    {"text": "Title",    "weight": 0.30, "min": 140, "anchor": tk.W},
+    "act":      {"text": "",         "weight": 0.04, "min": 34,  "anchor": tk.CENTER},
+    "title":    {"text": "Title",    "weight": 0.27, "min": 140, "anchor": tk.W},
     "kind":     {"text": "Format",   "weight": 0.08, "min": 60,  "anchor": tk.W},
     "quality":  {"text": "Quality",  "weight": 0.11, "min": 70,  "anchor": tk.W},
     "status":   {"text": "Status",   "weight": 0.11, "min": 70,  "anchor": tk.W},
-    "progress": {"text": "Progress", "weight": 0.18, "min": 120, "anchor": tk.W},
+    "progress": {"text": "Progress", "weight": 0.17, "min": 120, "anchor": tk.W},
     "size":     {"text": "Size",     "weight": 0.08, "min": 60,  "anchor": tk.E},
     "speed":    {"text": "Speed",    "weight": 0.08, "min": 60,  "anchor": tk.E},
     "eta":      {"text": "ETA",      "weight": 0.06, "min": 50,  "anchor": tk.E},
 }
+ACT_COLUMN = f"#{TREE_COLUMNS.index('act') + 1}"
+
+GLYPH_PLAY = "▶"    # black right-pointing triangle
+GLYPH_PAUSE = "‖"   # double vertical line -- present in far more fonts than U+23F8
 
 STATUS_QUEUED = "Queued"
 STATUS_RUNNING = "Downloading"
+STATUS_PAUSED = "Paused"
 STATUS_DONE = "Done"
 STATUS_FAILED = "Failed"
 STATUS_CANCELLED = "Cancelled"
 STATUS_SKIPPED = "Already have"
 FINISHED_STATES = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED, STATUS_SKIPPED)
+# Statuses whose play button starts (or restarts) the download.
+STARTABLE_STATES = (STATUS_QUEUED, STATUS_PAUSED, STATUS_FAILED, STATUS_CANCELLED)
 
 
 # --------------------------------------------------------------------------
@@ -305,6 +313,7 @@ DEFAULT_CONFIG = {
     "quality": BEST,
     "auto_probe": True,
     "auto_start": True,
+    "max_concurrent": 1,
     "clipboard_watch": True,
     "subtitles": False,
     "sub_langs": "en",
@@ -366,7 +375,9 @@ class Job:
     status: str = STATUS_QUEUED
     percent: float = 0.0
     speed: str = ""
+    speed_bytes: float = 0.0
     eta: str = ""
+    part: str = ""
     size: str = ""
     filepath: str = ""
     error: str = ""
@@ -425,9 +436,14 @@ class YtdlpGui:
         self.wake = threading.Event()
         self.shutdown = False
         self.paused = not self.cfg["auto_start"]
-        self.current_job: Job | None = None
-        self.current_proc: subprocess.Popen | None = None
-        self.cancel_requested = False
+
+        # Downloads run concurrently, so every piece of per-download state is
+        # keyed by job id rather than held as a single "current" value.
+        self.run_lock = threading.RLock()
+        self.active: set[str] = set()                  # jobs claimed by a thread
+        self.procs: dict[str, subprocess.Popen] = {}   # live yt-dlp processes
+        self.cancel_flags: set[str] = set()
+        self.pause_flags: set[str] = set()
 
         self.probe_seq = 0
         self.probe_after_id = None
@@ -453,7 +469,7 @@ class YtdlpGui:
         self._report_environment()
         self._restore_queue()
 
-        self.worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker = threading.Thread(target=self._scheduler_loop, daemon=True)
         self.worker.start()
         threading.Thread(target=self._check_version, daemon=True).start()
 
@@ -487,7 +503,7 @@ class YtdlpGui:
 
         self.str_vars: dict[str, tk.StringVar] = {}
         for key in ("sub_langs", "filename_template", "limit_rate", "cookies_browser",
-                    "concurrent_fragments", "retries"):
+                    "concurrent_fragments", "retries", "max_concurrent"):
             var = tk.StringVar(value=str(c[key]))
             var.trace_add("write", lambda *_, k=key: self._on_setting(k))
             self.str_vars[key] = var
@@ -504,7 +520,7 @@ class YtdlpGui:
                 self.wake.set()
         else:
             value = self.str_vars[key].get()
-            if key in ("concurrent_fragments", "retries"):
+            if key in ("concurrent_fragments", "retries", "max_concurrent"):
                 try:
                     value = max(1, int(value))
                 except ValueError:
@@ -530,7 +546,10 @@ class YtdlpGui:
 
         m_queue = tk.Menu(menubar, tearoff=0)
         m_queue.add_command(label="Start / pause queue", command=self.toggle_queue)
-        m_queue.add_command(label="Cancel current download", command=self.cancel_current)
+        m_queue.add_command(label="Start / resume selected", command=self.start_selected)
+        m_queue.add_command(label="Pause selected\tSpace", command=self.pause_selected)
+        m_queue.add_command(label="Pause all running", command=self.pause_running)
+        m_queue.add_command(label="Cancel all running", command=self.cancel_running)
         m_queue.add_separator()
         m_queue.add_command(label="Move up", command=lambda: self.move_selected(-1))
         m_queue.add_command(label="Move down", command=lambda: self.move_selected(1))
@@ -679,9 +698,12 @@ class YtdlpGui:
 
         bar = ttk.Frame(tab)
         bar.pack(fill=tk.X, pady=(0, 8))
-        self.start_button = ttk.Button(bar, text="Pause queue", width=14, command=self.toggle_queue)
+        self.start_button = ttk.Button(bar, text="Hold queue", width=13, command=self.toggle_queue)
         self.start_button.pack(side=tk.LEFT)
-        ttk.Button(bar, text="Cancel current", width=14, command=self.cancel_current).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Pause all", width=10,
+                   command=self.pause_running).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Cancel all", width=11,
+                   command=self.cancel_running).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(bar, text="Up", width=5, command=lambda: self.move_selected(-1)).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Down", width=6, command=lambda: self.move_selected(1)).pack(side=tk.LEFT, padx=2)
@@ -707,10 +729,16 @@ class YtdlpGui:
         self.tree.bind("<Configure>", self._fit_columns)
 
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
-        self.tree.bind("<Double-1>", lambda e: self.open_selected_file())
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Button-3>", self._show_context_menu)
+        self.tree.bind("<space>", lambda e: (self.toggle_selected(), "break")[1])
+        self.tree.bind("<Motion>", self._on_tree_motion)
 
         self.ctx = tk.Menu(self.root, tearoff=0)
+        self.ctx.add_command(label="Start / resume", command=self.start_selected)
+        self.ctx.add_command(label="Pause", command=self.pause_selected)
+        self.ctx.add_separator()
         self.ctx.add_command(label="Open file", command=self.open_selected_file)
         self.ctx.add_command(label="Show in folder", command=self.reveal_selected_file)
         self.ctx.add_separator()
@@ -763,6 +791,13 @@ class YtdlpGui:
                           ("Watch the clipboard for URLs", "clipboard_watch"),
                           ("Skip files already downloaded (download archive)", "use_archive")):
             ttk.Checkbutton(g1, text=text, variable=self.bool_vars[key]).pack(anchor=tk.W, pady=1)
+        row = ttk.Frame(g1)
+        row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(row, text="Downloads at the same time:").pack(side=tk.LEFT)
+        ttk.Spinbox(row, from_=1, to=8, width=4,
+                    textvariable=self.str_vars["max_concurrent"]).pack(side=tk.LEFT, padx=6)
+        ttk.Label(row, text="play on any row starts one extra",
+                  style="Muted.TLabel").pack(side=tk.LEFT)
 
         g2 = ttk.LabelFrame(left, text=" Subtitles ", padding=10)
         g2.pack(fill=tk.X, pady=(10, 0))
@@ -834,12 +869,12 @@ class YtdlpGui:
         ttk.Label(frame, text="Current:", width=9).grid(row=0, column=0, sticky=tk.W)
         self.current_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
         self.current_bar.grid(row=0, column=1, sticky=tk.EW, padx=6)
-        ttk.Label(frame, textvariable=self.current_label_var, width=38, anchor=tk.W).grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(frame, textvariable=self.current_label_var, width=44, anchor=tk.W).grid(row=0, column=2, sticky=tk.W)
 
         ttk.Label(frame, text="Queue:", width=9).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         self.overall_bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
         self.overall_bar.grid(row=1, column=1, sticky=tk.EW, padx=6, pady=(6, 0))
-        ttk.Label(frame, textvariable=self.overall_label_var, width=38, anchor=tk.W).grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
+        ttk.Label(frame, textvariable=self.overall_label_var, width=44, anchor=tk.W).grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
 
     def _build_statusbar(self):
         self.statusbar = ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
@@ -948,7 +983,8 @@ class YtdlpGui:
         self.thumb_label.configure(bg=panel, fg=muted, highlightbackground=border)
         for tag, colour in (("queued", muted), ("running", theme["run"]),
                             ("done", theme["ok"]), ("failed", theme["err"]),
-                            ("cancelled", theme["warn"]), ("skipped", muted)):
+                            ("cancelled", theme["warn"]), ("skipped", muted),
+                            ("paused", theme["warn"])):
             self.tree.tag_configure(tag, foreground=colour)
 
     # -- logging -----------------------------------------------------------
@@ -1387,7 +1423,8 @@ class YtdlpGui:
 
     @staticmethod
     def _row_values(job: Job) -> tuple:
-        return (job.display_title, job.kind.replace(" Video", "").replace(" Audio", ""),
+        return (action_glyph(job.status), job.display_title,
+                job.kind.replace(" Video", "").replace(" Audio", ""),
                 job.quality, job.status, bar_text(job.percent), job.size, job.speed, job.eta)
 
     def _update_row(self, job: Job):
@@ -1422,6 +1459,39 @@ class YtdlpGui:
         with self.jobs_lock:
             return [j for j in self.jobs if j.jid in ids]
 
+    def _is_act_cell(self, event) -> bool:
+        return (self.tree.identify_region(event.x, event.y) == "cell"
+                and self.tree.identify_column(event.x) == ACT_COLUMN)
+
+    def _on_tree_click(self, event):
+        """Clicking the first column acts as that row's play/pause button."""
+        if not self._is_act_cell(event):
+            return None
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        self.toggle_job(row)
+        return "break"          # do not also change the selection
+
+    def _on_double_click(self, event):
+        if self._is_act_cell(event):
+            return "break"      # the single click already handled it
+        self.open_selected_file()
+        return None
+
+    def _on_tree_motion(self, event):
+        self.tree.configure(cursor="hand2" if self._is_act_cell(event) else "")
+
+    def start_selected(self):
+        for job in self._selected_jobs():
+            if job.status in STARTABLE_STATES:
+                self.start_job(job)
+
+    def pause_selected(self):
+        for job in self._selected_jobs():
+            if job.status == STATUS_RUNNING:
+                self.pause_job(job)
+
     def _show_context_menu(self, event):
         row = self.tree.identify_row(event.y)
         if row:
@@ -1433,10 +1503,12 @@ class YtdlpGui:
         jobs = self._selected_jobs()
         if not jobs:
             return
-        removed = 0
+        removed = skipped = 0
         for job in jobs:
             if job.status == STATUS_RUNNING:
-                self.cancel_current()
+                # Stop it first; it disappears from the queue once the thread exits.
+                self.cancel_job(job)
+                skipped += 1
                 continue
             with self.jobs_lock:
                 if job in self.jobs:
@@ -1444,7 +1516,10 @@ class YtdlpGui:
             if self.tree.exists(job.jid):
                 self.tree.delete(job.jid)
             removed += 1
-        if removed:
+        if skipped:
+            self.set_status(f"Removed {removed} item(s); cancelled {skipped} running "
+                            "download(s) - remove them again once they stop.")
+        elif removed:
             self.set_status(f"Removed {removed} item(s).")
         self._refresh_overall()
         self._schedule_save()
@@ -1493,7 +1568,8 @@ class YtdlpGui:
     def _reset_job(self, job: Job):
         job.status = STATUS_QUEUED
         job.percent = 0.0
-        job.speed = job.eta = job.error = ""
+        job.speed = job.eta = job.error = job.part = ""
+        job.speed_bytes = 0.0
         self._update_row(job)
 
     def clear_finished(self):
@@ -1612,33 +1688,139 @@ class YtdlpGui:
         self._refresh_start_button()
         if not self.paused:
             self.wake.set()
-        self.set_status("Queue paused - the current download continues." if self.paused
-                        else "Queue running.")
+        self.set_status("Queue held - running downloads continue, nothing new starts."
+                        if self.paused else "Queue running.")
+        self._refresh_overall()
 
     def _refresh_start_button(self):
-        self.start_button.config(text="Start queue" if self.paused else "Pause queue")
+        self.start_button.config(text="Start queue" if self.paused else "Hold queue")
 
-    def cancel_current(self):
-        proc = self.current_proc
-        if not proc:
-            self.set_status("Nothing is downloading.")
-            return
-        if self.cancel_requested:
-            self.set_status("Already cancelling - waiting for yt-dlp to stop.")
-            return
-        self.cancel_requested = True
-        self.log("Cancelling current download...", "warning")
-        self.set_status("Cancelling...")
-        threading.Thread(target=kill_process_tree, args=(proc,), daemon=True).start()
+    @property
+    def max_concurrent(self) -> int:
+        try:
+            return max(1, int(self.cfg.get("max_concurrent", 1)))
+        except (TypeError, ValueError):
+            return 1
 
-    def _next_queued(self) -> Job | None:
+    def _running_jobs(self) -> list[Job]:
+        with self.jobs_lock:
+            return [j for j in self.jobs if j.status == STATUS_RUNNING]
+
+    def _job_by_id(self, jid: str) -> Job | None:
         with self.jobs_lock:
             for job in self.jobs:
-                if job.status == STATUS_QUEUED:
+                if job.jid == jid:
                     return job
         return None
 
-    def _worker_loop(self):
+    # -- per-item play / pause --------------------------------------------
+
+    def toggle_job(self, jid: str):
+        """The play/pause control in the first column of each row."""
+        job = self._job_by_id(jid)
+        if job is None:
+            return
+        if job.status == STATUS_RUNNING:
+            self.pause_job(job)
+        elif job.status in STARTABLE_STATES:
+            self.start_job(job)
+        else:
+            self.set_status(f"'{job.display_title}' has already finished.")
+
+    def toggle_selected(self):
+        for job in self._selected_jobs():
+            self.toggle_job(job.jid)
+
+    def start_job(self, job: Job):
+        """Start (or resume) one item now, regardless of the concurrency limit."""
+        if not self.ytdlp:
+            return
+        if not job.dest_dir or not Path(job.dest_dir).is_dir():
+            messagebox.showwarning(APP_NAME,
+                                   f"The download folder for this item no longer exists:\n"
+                                   f"{job.dest_dir}")
+            return
+        with self.run_lock:
+            if job.jid in self.active:
+                self.set_status(f"'{job.display_title}' is already running.")
+                return
+        if job.status in (STATUS_FAILED, STATUS_CANCELLED):
+            job.percent = 0.0          # a retry restarts the accounting
+        job.status = STATUS_QUEUED
+        job.error = ""
+        self._update_row(job)
+        if self._launch(job):
+            self.set_status(f"Started: {job.display_title}")
+
+    def pause_job(self, job: Job):
+        """
+        Stop yt-dlp but keep the partial file, so starting again continues from
+        where it stopped rather than from the beginning.
+        """
+        with self.run_lock:
+            if job.jid in self.pause_flags:
+                self.set_status("Already pausing - waiting for yt-dlp to stop.")
+                return
+            if job.jid not in self.active:
+                self.set_status("That item is not downloading.")
+                return
+            self.pause_flags.add(job.jid)
+            proc = self.procs.get(job.jid)
+        self.log(f"Pausing: {job.display_title}", "warning")
+        self.set_status(f"Pausing {job.display_title}...")
+        if proc is not None:
+            threading.Thread(target=kill_process_tree, args=(proc,), daemon=True).start()
+
+    def cancel_job(self, job: Job):
+        """Stop a download and discard it -- unlike pause, this does not resume."""
+        with self.run_lock:
+            if job.jid in self.cancel_flags or job.jid not in self.active:
+                return
+            self.cancel_flags.add(job.jid)
+            proc = self.procs.get(job.jid)
+        self.log(f"Cancelling: {job.display_title}", "warning")
+        if proc is not None:
+            threading.Thread(target=kill_process_tree, args=(proc,), daemon=True).start()
+
+    def cancel_running(self):
+        running = self._running_jobs()
+        if not running:
+            self.set_status("Nothing is downloading.")
+            return
+        for job in running:
+            self.cancel_job(job)
+        self.set_status(f"Cancelling {len(running)} download(s)...")
+
+    def pause_running(self):
+        running = self._running_jobs()
+        if not running:
+            self.set_status("Nothing is downloading.")
+            return
+        for job in running:
+            self.pause_job(job)
+
+    # -- scheduling --------------------------------------------------------
+
+    def _next_queued(self) -> Job | None:
+        with self.jobs_lock, self.run_lock:
+            for job in self.jobs:
+                if job.status == STATUS_QUEUED and job.jid not in self.active:
+                    return job
+        return None
+
+    def _launch(self, job: Job) -> bool:
+        """Claim a job and run it on its own thread. False if already claimed."""
+        with self.run_lock:
+            if job.jid in self.active:
+                return False
+            self.active.add(job.jid)
+            self.cancel_flags.discard(job.jid)
+            self.pause_flags.discard(job.jid)
+        threading.Thread(target=self._job_thread, args=(job,), daemon=True).start()
+        return True
+
+    def _scheduler_loop(self):
+        """Keep up to `max_concurrent` downloads running while the queue is live."""
         while not self.shutdown:
             self.wake.wait(0.4)
             self.wake.clear()
@@ -1646,22 +1828,32 @@ class YtdlpGui:
                 return
             if self.paused:
                 continue
-            job = self._next_queued()
-            if job is None:
-                continue
-            try:
-                self._run_job(job)
-            except Exception as exc:
-                job.status = STATUS_FAILED
-                job.error = str(exc)
-                self._after(self._update_row, job)
-                self.log(f"Unexpected error: {exc}", "error")
-            finally:
-                self.current_job = None
-                self.current_proc = None
-                self._after(self._refresh_overall)
-                self._after(self._schedule_save)
-                self.wake.set()
+            while not self.shutdown:
+                with self.run_lock:
+                    if len(self.active) >= self.max_concurrent:
+                        break
+                job = self._next_queued()
+                if job is None or not self._launch(job):
+                    break
+
+    def _job_thread(self, job: Job):
+        try:
+            self._run_job(job)
+        except Exception as exc:
+            job.status = STATUS_FAILED
+            job.error = str(exc)
+            self._after(self._update_row, job)
+            self.log(f"Unexpected error: {exc}", "error")
+        finally:
+            with self.run_lock:
+                self.active.discard(job.jid)
+                self.procs.pop(job.jid, None)
+                self.cancel_flags.discard(job.jid)
+                self.pause_flags.discard(job.jid)
+            self._after(self._refresh_overall)
+            self._after(self._refresh_running_bar)
+            self._after(self._schedule_save)
+            self.wake.set()
 
     # -- command building --------------------------------------------------
 
@@ -1743,27 +1935,39 @@ class YtdlpGui:
 
     # -- running a job -----------------------------------------------------
 
+    def _stopping(self, job: Job) -> bool:
+        with self.run_lock:
+            return job.jid in self.cancel_flags or job.jid in self.pause_flags
+
     def _run_job(self, job: Job) -> None:
-        self.current_job = job
-        self.cancel_requested = False
+        resuming = job.percent > 0
         job.status = STATUS_RUNNING
-        job.percent = 0.0
         job.error = ""
         self._after(self._update_row, job)
         self._after(self._refresh_overall)
-        self.log(f"Starting: {job.display_title}", "ok")
+        self.log(f"{'Resuming' if resuming else 'Starting'}: {job.display_title}", "ok")
 
         impersonate = bool((job.opts or {}).get("impersonate", self.cfg["impersonate"]))
         code, output = self._spawn(job, impersonate)
 
-        if (code != 0 and impersonate and not self.cancel_requested
+        if (code != 0 and impersonate and not self._stopping(job)
                 and re.search(r"impersonat|curl_cffi", output, re.IGNORECASE)):
             self.log("Retrying without browser impersonation...", "warning")
             code, output = self._spawn(job, False)
 
-        if self.cancel_requested:
+        with self.run_lock:
+            was_paused = job.jid in self.pause_flags
+            was_cancelled = job.jid in self.cancel_flags
+
+        if was_paused:
+            job.status = STATUS_PAUSED
+            job.speed = job.eta = ""
+            job.speed_bytes = 0.0
+            self.log(f"Paused: {job.display_title} - press play to continue", "warning")
+        elif was_cancelled:
             job.status = STATUS_CANCELLED
             job.speed = job.eta = ""
+            job.speed_bytes = 0.0
             self.log(f"Cancelled: {job.display_title}", "warning")
         elif code == 0:
             if job.status != STATUS_SKIPPED:
@@ -1773,15 +1977,17 @@ class YtdlpGui:
             else:
                 self.log(f"Already downloaded: {job.display_title}")
             job.speed = job.eta = ""
+            job.speed_bytes = 0.0
         else:
             job.status = STATUS_FAILED
             errors = [ln for ln in output.splitlines() if ln.startswith("ERROR")]
             job.error = errors[-1] if errors else f"yt-dlp exited with code {code}"
             job.speed = job.eta = ""
+            job.speed_bytes = 0.0
             self.log(f"Failed: {job.display_title} - {job.error}", "error")
 
         self._after(self._update_row, job)
-        self._after(self._reset_current_bar)
+        self._after(self._refresh_running_bar)
 
     def _spawn(self, job: Job, impersonate: bool) -> tuple[int, str]:
         cmd = self._build_command(job, impersonate)
@@ -1794,7 +2000,13 @@ class YtdlpGui:
                                     creationflags=CREATE_NO_WINDOW)
         except FileNotFoundError:
             return 1, "ERROR: yt-dlp executable not found."
-        self.current_proc = proc
+
+        with self.run_lock:
+            self.procs[job.jid] = proc
+            stop_now = job.jid in self.cancel_flags or job.jid in self.pause_flags
+        if stop_now:
+            # Pause or cancel arrived while the process was still starting up.
+            kill_process_tree(proc)
 
         expected_streams = 1 if job.kind in AUDIO_KINDS else 2
         finished_streams = 0
@@ -1815,7 +2027,10 @@ class YtdlpGui:
                 continue
 
             collected.append(line)
-            if "has already been downloaded" in line:
+            # Two different skips: the file is already on disk, or the download
+            # archive says we have fetched this id before.
+            if ("has already been downloaded" in line
+                    or "has already been recorded in the archive" in line):
                 job.status = STATUS_SKIPPED
                 job.percent = 100.0
                 self._after(self._update_row, job)
@@ -1824,14 +2039,17 @@ class YtdlpGui:
             self.log(line, level)
             if line.startswith(("[Merger]", "[ExtractAudio]", "[Fixup", "[EmbedSubtitle",
                                 "[Metadata]", "[SponsorBlock]", "[ThumbnailsConvertor]")):
-                self._after(self.current_label_var.set, "Processing...")
+                job.speed = job.eta = ""
+                job.speed_bytes = 0.0
+                self._after(self._update_row, job)
 
         try:
             proc.stdout.close()
         except Exception:
             pass
         code = proc.wait()
-        self.current_proc = None
+        with self.run_lock:
+            self.procs.pop(job.jid, None)
         return code, "\n".join(collected)
 
     def _handle_progress(self, job: Job, payload: str, expected: int, finished: int) -> int:
@@ -1857,24 +2075,40 @@ class YtdlpGui:
         job.percent = min(100.0, (completed + fraction) / streams * 100)
         job.size = human_bytes(total) if total else ""
         job.speed = (human_bytes(speed) + "/s") if speed else ""
+        job.speed_bytes = float(speed or 0.0)
         job.eta = human_eta(eta) if state != "finished" else ""
+        job.part = f"{min(finished + 1, streams)}/{streams}" if streams > 1 else ""
 
-        part_label = f"part {min(finished + 1, streams)}/{streams}" if streams > 1 else ""
-        label = f"{job.percent:.1f}%  {job.speed}  {('ETA ' + job.eta) if job.eta else ''}  {part_label}"
-        self._after(self._push_progress, job, label.strip())
+        self._after(self._push_progress, job)
         return finished
 
-    def _push_progress(self, job: Job, label: str):
-        self.current_bar["value"] = job.percent
-        self.current_label_var.set(label)
-        self.root.title(f"[{job.percent:.0f}%] {APP_NAME} {APP_VERSION}")
+    def _push_progress(self, job: Job):
         self._update_row(job)
+        self._refresh_running_bar()
         self._refresh_overall()
 
-    def _reset_current_bar(self):
-        self.current_bar["value"] = 0
-        self.current_label_var.set("Idle")
-        self.root.title(f"{APP_NAME} {APP_VERSION}")
+    def _refresh_running_bar(self):
+        """The 'Current' bar covers every running download, not just one."""
+        running = self._running_jobs()
+        if not running:
+            self.current_bar["value"] = 0
+            self.current_label_var.set("Idle")
+            self.root.title(f"{APP_NAME} {APP_VERSION}")
+            return
+
+        average = sum(j.percent for j in running) / len(running)
+        self.current_bar["value"] = average
+        if len(running) == 1:
+            job = running[0]
+            bits = [f"{job.percent:.1f}%", job.speed,
+                    f"ETA {job.eta}" if job.eta else "",
+                    f"part {job.part}" if job.part else ""]
+        else:
+            total_speed = sum(j.speed_bytes for j in running)
+            bits = [f"{len(running)} downloading", f"{average:.1f}% average",
+                    f"{human_bytes(total_speed)}/s" if total_speed else ""]
+        self.current_label_var.set("  ".join(b for b in bits if b))
+        self.root.title(f"[{average:.0f}%] {APP_NAME} {APP_VERSION}")
 
     def _refresh_overall(self):
         with self.jobs_lock:
@@ -1882,15 +2116,26 @@ class YtdlpGui:
             done = sum(1 for j in self.jobs if j.status in FINISHED_STATES)
             running = [j for j in self.jobs if j.status == STATUS_RUNNING]
             waiting = sum(1 for j in self.jobs if j.status == STATUS_QUEUED)
+            held = sum(1 for j in self.jobs if j.status == STATUS_PAUSED)
         if total == 0:
             self.overall_bar["value"] = 0
             self.overall_label_var.set("Queue empty")
             return
-        fraction = running[0].percent / 100 if running else 0.0
+        fraction = sum(j.percent for j in running) / 100
         percent = min(100.0, (done + fraction) / total * 100)
         self.overall_bar["value"] = percent
-        state = "paused" if self.paused else ("running" if running else "idle")
-        self.overall_label_var.set(f"{done}/{total} done - {waiting} waiting - {state}")
+
+        if running:
+            state = f"{len(running)} running"
+        elif self.paused:
+            state = "queue held"
+        else:
+            state = "idle"
+        parts = [f"{done}/{total} done", f"{waiting} waiting"]
+        if held:
+            parts.append(f"{held} paused")
+        parts.append(state)
+        self.overall_label_var.set(" - ".join(parts))
 
     # -- yt-dlp maintenance ------------------------------------------------
 
@@ -1955,6 +2200,8 @@ class YtdlpGui:
             "Delete\tRemove the selected queue items\n"
             "F5\tRetry every failed item\n"
             "Ctrl+L\tClear the log\n"
+            "Space\tPlay / pause the selected row\n"
+            "First column\tClick to play or pause that download\n"
             "Double-click\tOpen a finished file\n"
             "Right-click\tQueue item actions")
 
@@ -1971,15 +2218,18 @@ class YtdlpGui:
     # -- shutdown ----------------------------------------------------------
 
     def on_close(self):
-        if self.current_proc and not messagebox.askokcancel(
-                APP_NAME, "A download is still running. Quit anyway?"):
+        with self.run_lock:
+            live = list(self.procs.values())
+            count = len(self.active)
+        if count and not messagebox.askokcancel(
+                APP_NAME, f"{count} download(s) still running. Quit anyway?\n\n"
+                          "Partly downloaded files are kept, so they can be resumed."):
             return
         self.shutdown = True
         self.paused = True
-        self.cancel_requested = True
         self.wake.set()
-        if self.current_proc:
-            kill_process_tree(self.current_proc)
+        for proc in live:
+            kill_process_tree(proc)
         try:
             self.cfg["geometry"] = self.root.geometry()
         except Exception:
@@ -1997,7 +2247,17 @@ def status_tag(status: str) -> str:
     return {
         STATUS_QUEUED: "queued", STATUS_RUNNING: "running", STATUS_DONE: "done",
         STATUS_FAILED: "failed", STATUS_CANCELLED: "cancelled", STATUS_SKIPPED: "skipped",
+        STATUS_PAUSED: "paused",
     }.get(status, "queued")
+
+
+def action_glyph(status: str) -> str:
+    """The play/pause control shown in each queue row."""
+    if status == STATUS_RUNNING:
+        return GLYPH_PAUSE
+    if status in STARTABLE_STATES:
+        return GLYPH_PLAY
+    return ""
 
 
 def strip_size_note(label: str) -> str:
