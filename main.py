@@ -564,6 +564,11 @@ class YtdlpGui:
     # -- layout ------------------------------------------------------------
 
     def _build_ui(self):
+        # The status bar is packed before the expanding frame: pack gives space
+        # to earlier children first, so doing it the other way round lets a
+        # short window squeeze the status bar down to nothing.
+        self._build_statusbar()
+
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
         self.outer = outer
@@ -571,14 +576,15 @@ class YtdlpGui:
         self._build_source(outer)
         self._build_media(outer)
 
+        # Bottom-anchored before the notebook, for the same reason as the status
+        # bar: the notebook expands, and would otherwise eat this row.
+        self._build_progress(outer)
+
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(10, 8))
         self._build_queue_tab(self.notebook)
         self._build_log_tab(self.notebook)
         self._build_settings_tab(self.notebook)
-
-        self._build_progress(outer)
-        self._build_statusbar()
 
     def _build_source(self, parent):
         frame = ttk.LabelFrame(parent, text=" 1 - Source ", padding=10)
@@ -822,7 +828,7 @@ class YtdlpGui:
 
     def _build_progress(self, parent):
         frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X)
+        frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
         frame.columnconfigure(1, weight=1)
 
         ttk.Label(frame, text="Current:", width=9).grid(row=0, column=0, sticky=tk.W)

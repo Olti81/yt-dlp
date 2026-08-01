@@ -5,6 +5,15 @@ what the video actually offers, pick a quality, and let a queue download everyth
 at a time. Built with tkinter, packaged as a single `.exe` with yt-dlp and ffmpeg bundled
 inside — nothing to install.
 
+![The app in light mode](docs/screenshot-light.png)
+
+<details>
+<summary><b>Dark mode</b> — switchable in Settings</summary>
+
+![The app in dark mode](docs/screenshot-dark.png)
+
+</details>
+
 ## What it does
 
 **Inspect before you download.** Paste a URL and the media info is fetched automatically:
