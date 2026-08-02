@@ -101,6 +101,10 @@ def resource_path(*parts: str) -> Path:
     return bundle_dir().joinpath("resources", *parts)
 
 
+def asset_path(*parts: str) -> Path:
+    return bundle_dir().joinpath("assets", *parts)
+
+
 APP_DATA = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "yt-dlp-gui"
 CONFIG_FILE = APP_DATA / "config.json"
 QUEUE_FILE = APP_DATA / "queue.json"
@@ -463,6 +467,7 @@ class YtdlpGui:
         self.apply_theme(self.cfg["theme"])
 
         self.root.title(f"{APP_NAME} {APP_VERSION}")
+        self._set_window_icon()
         self._size_window()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -880,6 +885,28 @@ class YtdlpGui:
         self.statusbar = ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
                                    style="Status.TLabel", padding=(10, 4))
         self.statusbar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _set_window_icon(self):
+        """
+        Title bar and taskbar icon.
+
+        iconbitmap takes the .ico on Windows and gives the crispest result;
+        iconphoto with the PNG covers everything else. Losing the icon is never
+        worth failing to start over, so every step is best-effort.
+        """
+        ico, png = asset_path("icon.ico"), asset_path("icon.png")
+        if IS_WINDOWS and ico.is_file():
+            try:
+                self.root.iconbitmap(default=str(ico))
+                return
+            except tk.TclError:
+                pass
+        if png.is_file():
+            try:
+                self._icon_image = tk.PhotoImage(file=str(png))
+                self.root.iconphoto(True, self._icon_image)
+            except tk.TclError:
+                pass
 
     def _size_window(self):
         """

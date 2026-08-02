@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="72" align="right" alt="">
+
 # yt-dlp Downloader
 
 A Windows desktop front-end for [yt-dlp](https://github.com/yt-dlp/yt-dlp): paste a URL, see
@@ -93,6 +95,15 @@ pyinstaller main.spec --noconfirm
 
 The result is `dist/yt-dlp-gui-2.0.exe`, a single file of roughly 150 MB — most of which is
 the bundled ffmpeg.
+
+The icon is generated rather than drawn by hand, so there is no binary to edit: the skull is
+defined as a handful of superellipses in `tools/make_icon.py`, which rasterises it by
+supersampling and writes `assets/icon.ico` (eight sizes, 16–256 px) plus `assets/icon.png`.
+Adjust the shape constants and re-run it:
+
+```bash
+python tools/make_icon.py
+```
 
 ## Notes
 
