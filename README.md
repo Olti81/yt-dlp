@@ -112,6 +112,11 @@ python -m unittest discover tests
 
 ## Building the .exe
 
+On Windows, double-click **`build.cmd`**. It pulls the latest version with `git pull`, checks
+that `resources\` is in place, sets up PyInstaller in a private `.venv`, runs the tests and
+builds. To build local changes without pulling, run `set YTDLP_NO_PULL=1` first. Or do it by
+hand:
+
 ```bash
 pip install pyinstaller
 pyinstaller main.spec --noconfirm
@@ -137,7 +142,9 @@ now. Chromium writes a tab's title there some time after the page loads, so miss
 looked up in a copy of the profile's history. Firefox and its forks write
 `sessionstore-backups\recovery.jsonlz4`, LZ4-compressed JSON. Both are read with the standard
 library only. Browsers that are not running are left out unless you tick *Include closed
-browsers*, since their files describe the tabs from the last time they ran.
+browsers*, since their files describe the tabs from the last time they ran. If a running
+browser keeps its session file locked, the scan lists the video pages visited in that
+browser over the last 24 hours instead, unticked and marked *history*.
 
 **Keep yt-dlp current.** Sites change constantly and a stale yt-dlp is the most common cause
 of a download that suddenly stops working. The app shows the version and its age in
