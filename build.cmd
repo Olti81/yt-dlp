@@ -67,8 +67,27 @@ echo Updating PyInstaller ...
 echo Running tests ...
 ".venv\Scripts\python.exe" -m unittest discover -s tests -q || goto :fail
 
+rem -- A running copy of the app keeps its .exe locked, and PyInstaller would
+rem    only fail at the very end trying to overwrite it
+if exist "dist\yt-dlp-gui-*.exe" del /q "dist\yt-dlp-gui-*.exe" >nul 2>&1
+if exist "dist\yt-dlp-gui-*.exe" (
+    echo The old dist\yt-dlp-gui .exe is in use. Close the app and run the build again.
+    goto :fail
+)
+
+rem -- Build in a fresh folder in the temp directory. PyInstaller has to delete its old
+rem    work folder first, and Windows refuses while anything still has a file
+rem    open in it - antivirus scanning new files, an Explorer window, the
+rem    indexer - which fails the whole build with "Access is denied".
+set "WORK=%TEMP%\yt-dlp-gui-build"
+if exist "%WORK%" rmdir /s /q "%WORK%" >nul 2>&1
+if exist "%WORK%" set "WORK=%TEMP%\yt-dlp-gui-build-%RANDOM%%RANDOM%"
+rem    The work folder older versions of this script left in the project
+if exist "build" rmdir /s /q "build" >nul 2>&1
+
 echo Building ...
-".venv\Scripts\python.exe" -m PyInstaller main.spec --noconfirm --clean || goto :fail
+".venv\Scripts\python.exe" -m PyInstaller main.spec --noconfirm --workpath "%WORK%" || goto :fail
+if exist "%WORK%" rmdir /s /q "%WORK%" >nul 2>&1
 
 echo.
 echo Done:
