@@ -61,6 +61,7 @@ class BrowserResult:
     tabs: list[BrowserTab]
     error: str = ""
     history_hours: int = 0   # >0: open tabs were unreadable, recent history used instead
+    via_extension: bool = False  # tabs reported live by the companion browser extension
 
     @property
     def source(self) -> str:
@@ -565,21 +566,46 @@ def _usable(url: str) -> bool:
 HISTORY_FALLBACK_HOURS = 24
 
 
+def running_chromium_browsers(chromium: list | None = None) -> set[str]:
+    """Names of the Chromium-based browsers that are running now."""
+    processes = running_process_names()
+    return {name for name, exes, roots in (CHROMIUM_BROWSERS if chromium is None else chromium)
+            if _is_running(processes, exes) and any(root.is_dir() for root in roots)}
+
+
 def scan_browsers(include_closed: bool = False,
                   chromium: list | None = None,
-                  firefox: list | None = None) -> list[BrowserResult]:
+                  firefox: list | None = None,
+                  live: list | None = None) -> list[BrowserResult]:
     """
     Read the open tabs of every browser profile found on this machine.
 
     Browsers that are not running only contribute when `include_closed` is set:
     their session files still describe the tabs from the last time they ran.
+
+    `live` holds tabbridge.Snapshot objects from the companion extension. A
+    running browser that has one is taken from it rather than from its session
+    file, which Chromium keeps locked while it runs.
     """
     processes = running_process_names()
     results: list[BrowserResult] = []
+    live_by_browser: dict[str, list] = {}
+    for snap in live or []:
+        live_by_browser.setdefault(snap.browser, []).append(snap)
 
     for name, exes, roots in (CHROMIUM_BROWSERS if chromium is None else chromium):
         running = _is_running(processes, exes)
         if not running and not include_closed:
+            continue
+        snaps = live_by_browser.get(name) if running else None
+        if snaps:
+            for number, snap in enumerate(snaps, 1):
+                profile = f"profile {number}" if len(snaps) > 1 else ""
+                result = BrowserResult(name, profile, True, [], via_extension=True)
+                for url, title in snap.tabs:
+                    if _usable(url):
+                        result.tabs.append(BrowserTab(name, profile, url, title, True))
+                results.append(result)
             continue
         for root in roots:
             if not root.is_dir():

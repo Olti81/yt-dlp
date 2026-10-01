@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # Build:  .venv\Scripts\pyinstaller.exe main.spec --noconfirm
-# Output: dist/yt-dlp-gui-2.1.exe   (single file, no console window)
+# Output: dist/yt-dlp-gui-2.2.exe   (single file, no console window)
 #
 # `resources` is bundled whole: yt-dlp.exe, ffmpeg/ffprobe and the av* DLLs.
 
@@ -9,7 +9,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('resources', 'resources'), ('assets', 'assets')],
+    datas=[('resources', 'resources'), ('assets', 'assets'), ('browser_extension', 'browser_extension')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='yt-dlp-gui-2.1',
+    name='yt-dlp-gui-2.2',
     icon='assets/icon.ico',
     debug=False,
     bootloader_ignore_signals=False,

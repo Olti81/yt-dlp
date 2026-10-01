@@ -19,15 +19,19 @@ inside — nothing to install.
 ## What it does
 
 **Scan your browser tabs.** Got a dozen videos open in tabs? Press **Scan browser tabs**
-(Ctrl+T) instead of copying links one by one. The app reads the open tabs of Chrome, Brave,
-Edge, Vivaldi, Opera, Chromium, Firefox, LibreWolf, Waterfox, Zen and Floorp — every profile
-— and lists the ones with video or audio: a truncated title, the site and the browser, all
-ticked. One click on **Add N to queue** queues the lot, in whatever format and quality you
-pick in that window. Tabs already in the queue are marked and skipped, the same page open in
-two browsers is listed once, and *Show every tab* lets you tick pages the app does not
-recognise so yt-dlp can try them anyway. No browser extension and no setup: browsers keep
-their open tabs on disk for crash recovery, and that is what is read. A tab opened in the
-last few seconds may not have been written yet — press **Rescan**.
+(Ctrl+T) instead of copying links one by one: every video and audio tab open in your browsers
+goes straight into the queue, in the format and quality picked in the main window. Tabs
+already in the queue are skipped, and the same video open twice, or in two browsers, is
+queued once. To pick tabs one by one instead, use **File > Choose browser tabs to queue**
+(Ctrl+Shift+T): it lists them with a title, the site and the browser, all ticked, and *Show
+every tab* lets you tick pages the app does not recognise so yt-dlp can try them anyway.
+
+Firefox, LibreWolf, Waterfox, Zen and Floorp work with no setup: the app reads the tabs they
+keep on disk for crash recovery. **Chrome, Brave and Edge lock that file while they run**, so
+for them install the small companion extension once per browser — **Tools > Set up browser
+extension** walks you through it (Developer mode, *Load unpacked*, about a minute) and shows
+when each browser is working. The extension only tells this app, on this computer, which tabs
+are open.
 
 **Inspect before you download.** Paste a URL and the media info is fetched automatically:
 title, uploader, duration, thumbnail, and the resolutions that genuinely exist for that video
@@ -69,7 +73,7 @@ stops it and takes it off the queue in one go.
 
 ## Getting started
 
-Run `yt-dlp-gui-2.1.exe`. There is no installer and no dependency to set up.
+Run `yt-dlp-gui-2.2.exe`. There is no installer and no dependency to set up.
 
 On first launch it copies its bundled `yt-dlp.exe` into `%LOCALAPPDATA%\yt-dlp-gui\bin` and
 runs it from there. That is deliberate: it means **Tools → Update yt-dlp** can replace the
@@ -84,6 +88,7 @@ Everything the app writes lives in `%LOCALAPPDATA%\yt-dlp-gui`:
 | `archive.txt` | Download archive (only when enabled) |
 | `bin\yt-dlp.exe` | The updatable yt-dlp copy |
 | `thumbs\` | Cached preview thumbnails |
+| `browser-extension\` | The companion extension, for the browser's *Load unpacked* |
 
 ## Running from source
 
@@ -103,8 +108,9 @@ from source, create it and add:
 
 If `resources/` is missing, the app falls back to `yt-dlp` and `ffmpeg` on your `PATH`.
 
-The browser tab scanner lives in `tabscan.py` and has tests, which use recorded Chromium and
-Firefox session files from `tests/data`:
+The browser tab scanner lives in `tabscan.py`, the listener for the companion extension in
+`tabbridge.py` and the extension itself in `browser_extension/`. The tests use recorded
+Chromium and Firefox session files from `tests/data`:
 
 ```bash
 python -m unittest discover tests
@@ -122,7 +128,7 @@ pip install pyinstaller
 pyinstaller main.spec --noconfirm
 ```
 
-The result is `dist/yt-dlp-gui-2.1.exe`, a single file of roughly 150 MB — most of which is
+The result is `dist/yt-dlp-gui-2.2.exe`, a single file of roughly 150 MB — most of which is
 the bundled ffmpeg.
 
 The icon is generated rather than drawn by hand, so there is no binary to edit: the skull is
@@ -142,9 +148,18 @@ now. Chromium writes a tab's title there some time after the page loads, so miss
 looked up in a copy of the profile's history. Firefox and its forks write
 `sessionstore-backups\recovery.jsonlz4`, LZ4-compressed JSON. Both are read with the standard
 library only. Browsers that are not running are left out unless you tick *Include closed
-browsers*, since their files describe the tabs from the last time they ran. If a running
-browser keeps its session file locked, the scan lists the video pages visited in that
-browser over the last 24 hours instead, unticked and marked *history*.
+browsers*, since their files describe the tabs from the last time they ran.
+
+Current Chrome, Brave and Edge open the live session file exclusively, so on Windows no other
+program can read it while they run — not even as administrator. The companion extension
+(`browser_extension/`, Manifest V3, permissions `tabs`, `alarms` and `storage`) asks the
+browser for its tabs instead and posts them to `http://127.0.0.1:47813/tabs` whenever a tab
+changes and every 30 seconds. The app (`tabbridge.py`) only accepts posts whose `Origin` is a
+browser extension, so a web page cannot plant links in the queue, and holds the port
+exclusively. Right after the app starts, a scan waits up to 35 seconds for a browser that has
+reported before. A running browser without the extension falls back to the video pages
+visited in its history over the last 24 hours: listed, unticked and marked *history*, in the
+*Choose browser tabs* window, and never queued by the button.
 
 **Keep yt-dlp current.** Sites change constantly and a stale yt-dlp is the most common cause
 of a download that suddenly stops working. The app shows the version and its age in
