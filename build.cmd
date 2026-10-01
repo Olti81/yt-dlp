@@ -1,11 +1,37 @@
 @echo off
 rem Rebuild dist\yt-dlp-gui-<version>.exe from source.
 rem Double-click it, or run "build.cmd" from a terminal in this folder.
-rem   build.cmd           update the build environment, test, build
+rem   build.cmd           pull the latest code, update the build environment, test, build
 rem   build.cmd nopause   same, but do not wait for a key at the end
+rem   set YTDLP_NO_PULL=1 build without pulling (for testing local changes)
 
 setlocal
 cd /d "%~dp0"
+
+rem -- Get the latest version first. git may rewrite this very script, and cmd
+rem    reads a running script line by line from a byte offset, so the pull and a
+rem    restart of the updated script happen inside one block, which cmd has
+rem    already read in full before any of it runs.
+if not defined YTDLP_PULLED if not defined YTDLP_NO_PULL (
+    set "YTDLP_PULLED=1"
+    where git >nul 2>&1
+    if errorlevel 1 (
+        echo git was not found - building the code as it is on disk.
+    ) else if not exist ".git" (
+        echo This folder is not a git checkout - building the code as it is on disk.
+    ) else (
+        echo Pulling the latest version ...
+        git pull --ff-only
+        if errorlevel 1 (
+            echo.
+            echo WARNING: git pull failed - no network, or local changes that conflict.
+            echo Building the code as it is on disk.
+            echo.
+        )
+    )
+    call "%~f0" %*
+    exit /b
+)
 
 rem -- Python: the py launcher picks 3.13 if it is installed, else plain python
 set "PY="
