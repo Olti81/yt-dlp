@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-yt-dlp Downloader 2.0
+yt-dlp Downloader 2.1
 =====================
 
 A tkinter front-end for yt-dlp with automatic media inspection, a persistent
-download queue, live progress and a settings panel.
+download queue, live progress, a settings panel, and a scanner that queues the
+video and audio tabs open in your browsers in one go.
 
 Everything the app writes lives in %LOCALAPPDATA%\\yt-dlp-gui (config, queue,
 download archive, thumbnail cache and an updatable copy of yt-dlp.exe).
@@ -23,19 +24,23 @@ import threading
 import time
 import urllib.request
 import uuid
+import webbrowser
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import tabscan
+
 APP_NAME = "yt-dlp Downloader"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 IS_WINDOWS = platform.system() == "Windows"
 
 # Sentinels used to pick our own machine-readable lines out of yt-dlp's output.
 P_TAG = "@@P@@"
 F_TAG = "@@FILE@@"
+T_TAG = "@@TITLE@@"
 PROGRESS_TEMPLATE = (
     "download:" + P_TAG +
     "%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
@@ -45,10 +50,15 @@ PROGRESS_TEMPLATE = (
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 URL_RE = re.compile(r"^(https?://|www\.)\S+$", re.IGNORECASE)
+# URLs anywhere in a block of text: a pasted list, a chat message, an e-mail.
+URL_FIND_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"'`]+", re.IGNORECASE)
 
 VIDEO_KINDS = ["MP4 Video", "MKV Video", "WEBM Video"]
 AUDIO_KINDS = ["MP3 Audio", "M4A Audio", "WAV Audio", "FLAC Audio", "Opus Audio"]
 ALL_KINDS = VIDEO_KINDS + AUDIO_KINDS
+
+COOKIE_BROWSERS = ["", "chrome", "brave", "edge", "firefox", "opera", "vivaldi",
+                   "chromium", "safari", "whale"]
 
 BEST = "Best available"
 QUALITY_LADDER = [2160, 1440, 1080, 720, 480, 360, 240, 144]
@@ -221,7 +231,19 @@ def looks_like_url(text: str) -> bool:
 
 
 def split_urls(text: str) -> list[str]:
-    return [line.strip() for line in (text or "").splitlines() if looks_like_url(line)]
+    """Every URL in `text`, in order and without repeats."""
+    found = []
+    for match in URL_FIND_RE.findall(text or ""):
+        url = match.rstrip(".,;:!?)]}>")
+        if url.lower().startswith("www."):
+            url = "https://" + url
+        found.append(url)
+    return list(dict.fromkeys(found))
+
+
+def truncate(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
 
 
 def open_in_explorer(path: str, select: bool = False):
@@ -319,6 +341,9 @@ DEFAULT_CONFIG = {
     "auto_start": True,
     "max_concurrent": 1,
     "clipboard_watch": True,
+    "notify_done": True,
+    "scan_show_all": False,
+    "scan_include_closed": False,
     "subtitles": False,
     "sub_langs": "en",
     "auto_subs": False,
@@ -448,6 +473,8 @@ class YtdlpGui:
         self.procs: dict[str, subprocess.Popen] = {}   # live yt-dlp processes
         self.cancel_flags: set[str] = set()
         self.pause_flags: set[str] = set()
+        self.remove_when_stopped: set[str] = set()
+        self.batch_active = False                      # for the "all finished" notice
 
         self.probe_seq = 0
         self.probe_after_id = None
@@ -456,6 +483,8 @@ class YtdlpGui:
         self.probe_info: dict | None = None
         self.thumb_image: tk.PhotoImage | None = None
         self.save_after_id = None
+        self.scan_dialog: TabScanDialog | None = None
+        self.batch_dialog: BatchDialog | None = None
 
         self.ytdlp, notes = resolve_ytdlp()
         self.ffmpeg = resolve_ffmpeg()
@@ -473,6 +502,7 @@ class YtdlpGui:
 
         self._report_environment()
         self._restore_queue()
+        self._refresh_overall()
 
         self.worker = threading.Thread(target=self._scheduler_loop, daemon=True)
         self.worker.start()
@@ -498,7 +528,7 @@ class YtdlpGui:
         self.version_var = tk.StringVar(value="yt-dlp: checking...")
 
         self.bool_vars: dict[str, tk.BooleanVar] = {}
-        for key in ("auto_probe", "auto_start", "clipboard_watch", "subtitles",
+        for key in ("auto_probe", "auto_start", "clipboard_watch", "notify_done", "subtitles",
                     "auto_subs", "embed_subs", "embed_thumbnail", "embed_metadata",
                     "sponsorblock", "playlist_subfolder", "restrict_filenames",
                     "use_archive", "impersonate"):
@@ -542,6 +572,8 @@ class YtdlpGui:
         m_file.add_command(label="Paste URL\tCtrl+V", command=self.paste_url)
         m_file.add_command(label="Fetch media info\tEnter", command=self.probe_now)
         m_file.add_command(label="Add to queue\tCtrl+Enter", command=self.add_to_queue)
+        m_file.add_command(label="Add many URLs...\tCtrl+M", command=self.open_batch_dialog)
+        m_file.add_command(label="Scan browser tabs...\tCtrl+T", command=self.open_scan_dialog)
         m_file.add_separator()
         m_file.add_command(label="Choose download folder...\tCtrl+O", command=self.browse_dir)
         m_file.add_command(label="Open download folder", command=lambda: open_in_explorer(self.dir_var.get()))
@@ -558,6 +590,9 @@ class YtdlpGui:
         m_queue.add_separator()
         m_queue.add_command(label="Move up", command=lambda: self.move_selected(-1))
         m_queue.add_command(label="Move down", command=lambda: self.move_selected(1))
+        m_queue.add_command(label="Move to top", command=lambda: self.move_selected_to_edge(True))
+        m_queue.add_command(label="Move to bottom", command=lambda: self.move_selected_to_edge(False))
+        m_queue.add_command(label="Select all\tCtrl+A", command=self.select_all)
         m_queue.add_command(label="Remove selected\tDel", command=self.remove_selected)
         m_queue.add_separator()
         m_queue.add_command(label="Retry failed\tF5", command=self.retry_failed)
@@ -579,7 +614,9 @@ class YtdlpGui:
 
         self.root.config(menu=menubar)
 
-        self.root.bind("<Control-v>", lambda e: (self.paste_url(), "break")[1])
+        self.root.bind("<Control-v>", self._on_ctrl_v)
+        self.root.bind("<Control-t>", lambda e: self.open_scan_dialog())
+        self.root.bind("<Control-m>", lambda e: (self.open_batch_dialog(), "break")[1])
         self.root.bind("<Control-o>", lambda e: self.browse_dir())
         self.root.bind("<Control-l>", lambda e: self.clear_log())
         self.root.bind("<Control-Return>", lambda e: self.add_to_queue())
@@ -627,10 +664,21 @@ class YtdlpGui:
         ttk.Button(row, text="Clear", width=8, command=self.clear_url).grid(row=0, column=2, padx=2)
         self.fetch_button = ttk.Button(row, text="Fetch info", width=12, command=self.probe_now)
         self.fetch_button.grid(row=0, column=3, padx=(2, 0))
+        ttk.Separator(row, orient=tk.VERTICAL).grid(row=0, column=4, sticky=tk.NS, padx=10)
+        self.batch_button = ttk.Button(row, text="Add many...", width=12,
+                                       command=self.open_batch_dialog)
+        self.batch_button.grid(row=0, column=5, padx=2)
+        self.scan_button = ttk.Button(row, text="Scan browser tabs", style="Accent.TButton",
+                                      command=self.open_scan_dialog)
+        self.scan_button.grid(row=0, column=6, padx=(2, 0))
 
-        self.probe_bar = ttk.Progressbar(frame, mode="indeterminate", length=120)
-        self.probe_status = ttk.Label(frame, textvariable=self.probe_status_var, style="Muted.TLabel")
-        self.probe_status.grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        status_row = ttk.Frame(frame)
+        status_row.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        status_row.columnconfigure(0, weight=1)
+        self.probe_status = ttk.Label(status_row, textvariable=self.probe_status_var,
+                                      style="Muted.TLabel")
+        self.probe_status.grid(row=0, column=0, sticky=tk.W)
+        self.probe_bar = ttk.Progressbar(status_row, mode="indeterminate", length=120)
 
     def _build_media(self, parent):
         frame = ttk.LabelFrame(parent, text=" 2 - Media and quality ", padding=10)
@@ -700,6 +748,7 @@ class YtdlpGui:
     def _build_queue_tab(self, nb):
         tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="  Queue  ")
+        self.queue_tab = tab
 
         bar = ttk.Frame(tab)
         bar.pack(fill=tk.X, pady=(0, 8))
@@ -733,7 +782,15 @@ class YtdlpGui:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<Configure>", self._fit_columns)
 
+        # Shown over the empty table, so a first-time user knows where to start.
+        self.empty_label = tk.Label(
+            self.tree, justify=tk.CENTER, font=("Segoe UI", 10),
+            text="The queue is empty.\n\nPaste a link above, use 'Add many...' for a list "
+                 "of links,\nor 'Scan browser tabs' to queue every video and audio tab "
+                 "you have open.")
+
         self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        self.tree.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Button-3>", self._show_context_menu)
@@ -748,11 +805,16 @@ class YtdlpGui:
         self.ctx.add_command(label="Show in folder", command=self.reveal_selected_file)
         self.ctx.add_separator()
         self.ctx.add_command(label="Copy URL", command=self.copy_selected_url)
+        self.ctx.add_command(label="Open URL in browser", command=self.open_selected_url)
         self.ctx.add_command(label="Load URL into source box", command=self.load_selected_url)
         self.ctx.add_separator()
+        self.ctx.add_command(label="Use the current format and quality",
+                             command=self.apply_format_to_selected)
         self.ctx.add_command(label="Retry", command=self.retry_selected)
         self.ctx.add_command(label="Move up", command=lambda: self.move_selected(-1))
         self.ctx.add_command(label="Move down", command=lambda: self.move_selected(1))
+        self.ctx.add_command(label="Move to top", command=lambda: self.move_selected_to_edge(True))
+        self.ctx.add_command(label="Move to bottom", command=lambda: self.move_selected_to_edge(False))
         self.ctx.add_command(label="Remove", command=self.remove_selected)
         self.ctx.add_separator()
         self.ctx.add_command(label="Show error", command=self.show_selected_error)
@@ -794,6 +856,7 @@ class YtdlpGui:
         for text, key in (("Fetch media info automatically while typing", "auto_probe"),
                           ("Start downloading automatically when items are queued", "auto_start"),
                           ("Watch the clipboard for URLs", "clipboard_watch"),
+                          ("Beep and flash the taskbar when the queue is finished", "notify_done"),
                           ("Skip files already downloaded (download archive)", "use_archive")):
             ttk.Checkbutton(g1, text=text, variable=self.bool_vars[key]).pack(anchor=tk.W, pady=1)
         row = ttk.Frame(g1)
@@ -838,10 +901,15 @@ class YtdlpGui:
         fields = [("Speed limit", "limit_rate", "2M / 500K - blank = off"),
                   ("Parallel fragments", "concurrent_fragments", "1-16"),
                   ("Retries", "retries", ""),
-                  ("Cookies from browser", "cookies_browser", "chrome / firefox / edge")]
+                  ("Cookies from browser", "cookies_browser", "for sites that need a login")]
         for i, (label, key, hint) in enumerate(fields):
             ttk.Label(grid, text=label + ":").grid(row=i, column=0, sticky=tk.W, pady=2)
-            ttk.Entry(grid, textvariable=self.str_vars[key], width=16).grid(row=i, column=1, sticky=tk.W, padx=6)
+            if key == "cookies_browser":
+                widget = ttk.Combobox(grid, textvariable=self.str_vars[key], width=14,
+                                      values=COOKIE_BROWSERS)
+            else:
+                widget = ttk.Entry(grid, textvariable=self.str_vars[key], width=16)
+            widget.grid(row=i, column=1, sticky=tk.W, padx=6)
             if hint:
                 ttk.Label(grid, text=hint, style="Muted.TLabel").grid(row=i, column=2, sticky=tk.W)
 
@@ -1008,6 +1076,13 @@ class YtdlpGui:
             self.log_text.tag_config(tag, foreground=colour)
 
         self.thumb_label.configure(bg=panel, fg=muted, highlightbackground=border)
+        self.empty_label.configure(bg=panel, fg=muted)
+        for dialog in (self.scan_dialog, self.batch_dialog):
+            if dialog is not None:
+                try:
+                    dialog.apply_theme()
+                except tk.TclError:
+                    pass
         for tag, colour in (("queued", muted), ("running", theme["run"]),
                             ("done", theme["ok"]), ("failed", theme["err"]),
                             ("cancelled", theme["warn"]), ("skipped", muted),
@@ -1076,11 +1151,28 @@ class YtdlpGui:
 
     # -- URL handling / probing -------------------------------------------
 
+    def _on_ctrl_v(self, event):
+        """
+        Ctrl+V anywhere loads the clipboard as the source URL -- except in other
+        text fields (settings, dialogs), where it must stay an ordinary paste.
+        """
+        widget = event.widget
+        if (widget is not self.url_entry and widget is not self.log_text
+                and isinstance(widget, (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox))):
+            return None
+        self.paste_url()
+        return "break"
+
     def paste_url(self):
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
             self.set_status("Clipboard is empty or does not contain text.")
+            return
+        if len(split_urls(text)) > 1:
+            # A single-line box is no place for a list: hand it to the batch window.
+            self.last_clipboard = text.strip()
+            self.open_batch_dialog(text)
             return
         self.url_var.set(text.strip())
         self.last_clipboard = text.strip()
@@ -1148,7 +1240,7 @@ class YtdlpGui:
         if message:
             self.probe_status_var.set(message)
         if active:
-            self.probe_bar.grid(row=1, column=2, sticky=tk.E, pady=(8, 0))
+            self.probe_bar.grid(row=0, column=1, sticky=tk.E)
             self.probe_bar.start(12)
             self.fetch_button.config(state=tk.DISABLED)
         else:
@@ -1365,10 +1457,8 @@ class YtdlpGui:
         if not self.ytdlp:
             messagebox.showerror(APP_NAME, "yt-dlp was not found, so nothing can be downloaded.")
             return
-        dest = self.dir_var.get().strip()
-        if not dest or not Path(dest).is_dir():
-            messagebox.showwarning(APP_NAME, "Choose a valid download folder first.")
-            self.browse_dir()
+        dest = self._check_destination()
+        if not dest:
             return
 
         text = self.url_var.get().strip()
@@ -1386,6 +1476,22 @@ class YtdlpGui:
 
         info = self.probe_info
         single = len(urls) == 1 and info is not None and urls[0] == self.last_probed_url
+
+        if len(urls) == 1:
+            twin = self._find_duplicate(urls[0])
+            if twin is not None and not messagebox.askyesno(
+                    APP_NAME, f"This is already in the queue ({twin.status.lower()}):\n\n"
+                              f"{twin.display_title}\n\nAdd it again?"):
+                return
+        else:
+            known = self._queued_keys()
+            fresh = [u for u in urls if tabscan.url_key(u) not in known]
+            if len(fresh) < len(urls):
+                self.log(f"Skipped {len(urls) - len(fresh)} URL(s) already in the queue.")
+            urls = fresh
+            if not urls:
+                self.set_status("Every one of those URLs is already in the queue.")
+                return
 
         if single and info.get("_type") == "playlist" and info.get("entries"):
             entries = [e for e in info["entries"] if e and (e.get("url") or e.get("id"))]
@@ -1418,24 +1524,99 @@ class YtdlpGui:
                 added.append(Job(url=url, title=title, uploader=uploader, duration=duration,
                                  kind=kind, quality=quality, dest_dir=dest, opts=opts))
 
+        self._remember_choice()
+        self._enqueue(added)
+        self.url_var.set("")
+        self._reset_media_panel()
+        self.url_entry.focus_set()
+
+    def _enqueue(self, added: list[Job], source: str = ""):
+        """Append jobs to the queue and get the scheduler going."""
+        if not added:
+            return
         with self.jobs_lock:
             self.jobs.extend(added)
         for job in added:
             self._insert_row(job)
-        self._remember_choice()
-        self.log(f"Queued {len(added)} item(s).", "ok")
-        self.set_status(f"Added {len(added)} item(s) to the queue.")
+        origin = f" from {source}" if source else ""
+        self.log(f"Queued {len(added)} item(s){origin}.", "ok")
+        self.set_status(f"Added {len(added)} item(s) to the queue{origin}.")
         self._refresh_overall()
         self._schedule_save()
-
-        self.url_var.set("")
-        self._reset_media_panel()
-        self.url_entry.focus_set()
+        self.notebook.select(self.queue_tab)
 
         if self.cfg["auto_start"]:
             self.paused = False
             self._refresh_start_button()
         self.wake.set()
+
+    def _check_destination(self) -> str | None:
+        dest = self.dir_var.get().strip()
+        if not dest or not Path(dest).is_dir():
+            messagebox.showwarning(APP_NAME, "Choose a valid download folder first.")
+            self.browse_dir()
+            return None
+        return dest
+
+    def _queued_keys(self) -> set[str]:
+        with self.jobs_lock:
+            return {tabscan.url_key(j.url) for j in self.jobs}
+
+    def _find_duplicate(self, url: str) -> Job | None:
+        key = tabscan.url_key(url)
+        with self.jobs_lock:
+            for job in self.jobs:
+                if tabscan.url_key(job.url) == key:
+                    return job
+        return None
+
+    def queue_entries(self, entries: list[tuple[str, str, bool]], kind: str, quality: str,
+                      source: str = "") -> tuple[int, int]:
+        """
+        Bulk-add (url, title, whole_playlist) entries from the batch and tab-scan
+        windows. URLs that are already queued are skipped. Returns (added, skipped).
+        """
+        if not self.ytdlp:
+            messagebox.showerror(APP_NAME, "yt-dlp was not found, so nothing can be downloaded.")
+            return 0, 0
+        dest = self._check_destination()
+        if not dest:
+            return 0, 0
+        known = self._queued_keys()
+        opts = self._snapshot_options()
+        jobs: list[Job] = []
+        skipped = 0
+        for url, title, playlist in entries:
+            key = tabscan.url_key(url)
+            if key in known:
+                skipped += 1
+                continue
+            known.add(key)
+            jobs.append(Job(url=url, title=title, kind=kind, quality=quality, dest_dir=dest,
+                            whole_playlist=playlist, opts=opts))
+        self._enqueue(jobs, source)
+        if skipped:
+            self.log(f"Skipped {skipped} item(s) already in the queue.")
+        return len(jobs), skipped
+
+    def open_scan_dialog(self):
+        if self.scan_dialog is not None:
+            self.scan_dialog.top.deiconify()
+            self.scan_dialog.top.lift()
+            self.scan_dialog.top.focus_set()
+            self.scan_dialog.rescan()
+            return
+        self.scan_dialog = TabScanDialog(self)
+
+    def open_batch_dialog(self, text: str = ""):
+        if self.batch_dialog is not None:
+            self.batch_dialog.top.deiconify()
+            self.batch_dialog.top.lift()
+            if text:
+                self.batch_dialog.append_text(text)
+            self.batch_dialog.text.focus_set()
+            return
+        self.batch_dialog = BatchDialog(self, text)
 
     def _snapshot_options(self) -> dict:
         keys = ("subtitles", "auto_subs", "embed_subs", "sub_langs", "embed_thumbnail",
@@ -1530,26 +1711,78 @@ class YtdlpGui:
         jobs = self._selected_jobs()
         if not jobs:
             return
-        removed = skipped = 0
+        removed = stopping = 0
         for job in jobs:
-            if job.status == STATUS_RUNNING:
-                # Stop it first; it disappears from the queue once the thread exits.
+            with self.run_lock:
+                busy = job.jid in self.active
+            if busy:
+                # Stop it first; it leaves the queue once its thread has exited.
+                self.remove_when_stopped.add(job.jid)
                 self.cancel_job(job)
-                skipped += 1
+                stopping += 1
                 continue
-            with self.jobs_lock:
-                if job in self.jobs:
-                    self.jobs.remove(job)
-            if self.tree.exists(job.jid):
-                self.tree.delete(job.jid)
+            self._drop_job(job)
             removed += 1
-        if skipped:
-            self.set_status(f"Removed {removed} item(s); cancelled {skipped} running "
-                            "download(s) - remove them again once they stop.")
+        if stopping:
+            self.set_status(f"Removed {removed} item(s); {stopping} running download(s) "
+                            "will be removed as soon as they stop.")
         elif removed:
             self.set_status(f"Removed {removed} item(s).")
         self._refresh_overall()
         self._schedule_save()
+
+    def _drop_job(self, job: Job):
+        with self.jobs_lock:
+            if job in self.jobs:
+                self.jobs.remove(job)
+        if self.tree.exists(job.jid):
+            self.tree.delete(job.jid)
+
+    def _drop_if_pending(self, jid: str):
+        """Finish a removal that had to wait for the download to stop."""
+        if jid not in self.remove_when_stopped:
+            return
+        self.remove_when_stopped.discard(jid)
+        job = self._job_by_id(jid)
+        if job is not None:
+            self._drop_job(job)
+            self._refresh_overall()
+            self._schedule_save()
+
+    def select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def move_selected_to_edge(self, top: bool):
+        jobs = self._selected_jobs()
+        if not jobs:
+            return
+        with self.jobs_lock:
+            rest = [j for j in self.jobs if j not in jobs]
+            self.jobs = jobs + rest if top else rest + jobs
+            order = [j.jid for j in self.jobs]
+        for position, jid in enumerate(order):
+            if self.tree.exists(jid):
+                self.tree.move(jid, "", position)
+        self.tree.see(jobs[0].jid if top else jobs[-1].jid)
+        self._schedule_save()
+
+    def apply_format_to_selected(self):
+        """Re-target queued items, e.g. switch a batch of tab scans to MP3."""
+        kind = self.kind_var.get()
+        quality = strip_size_note(self.quality_var.get())
+        changed = 0
+        for job in self._selected_jobs():
+            if job.status in (STATUS_RUNNING, STATUS_DONE, STATUS_SKIPPED):
+                continue
+            if job.kind != kind:
+                job.percent = 0.0  # a partial file in the old format is no use
+            job.kind, job.quality = kind, quality
+            self._update_row(job)
+            changed += 1
+        self.set_status(f"Set {changed} item(s) to {kind}, {quality}." if changed
+                        else "Only items that are not running or finished can be changed.")
+        if changed:
+            self._schedule_save()
 
     def move_selected(self, delta: int):
         jobs = self._selected_jobs()
@@ -1637,6 +1870,10 @@ class YtdlpGui:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(j.url for j in jobs))
             self.set_status("URL copied.")
+
+    def open_selected_url(self):
+        for job in self._selected_jobs()[:10]:
+            webbrowser.open(job.url)
 
     def load_selected_url(self):
         jobs = self._selected_jobs()
@@ -1877,9 +2114,11 @@ class YtdlpGui:
                 self.procs.pop(job.jid, None)
                 self.cancel_flags.discard(job.jid)
                 self.pause_flags.discard(job.jid)
+            self._after(self._drop_if_pending, job.jid)
             self._after(self._refresh_overall)
             self._after(self._refresh_running_bar)
             self._after(self._schedule_save)
+            self._after(self._check_queue_finished)
             self.wake.set()
 
     # -- command building --------------------------------------------------
@@ -1890,6 +2129,7 @@ class YtdlpGui:
                "--progress-delta", "0.3",
                "--progress-template", PROGRESS_TEMPLATE,
                "--print", f"after_move:{F_TAG}%(filepath)s",
+               "--print", f"before_dl:{T_TAG}%(title)s",
                "--retries", str(opts.get("retries", 10)),
                "--fragment-retries", str(opts.get("retries", 10)),
                "--concurrent-fragments", str(opts.get("concurrent_fragments", 4))]
@@ -1967,6 +2207,7 @@ class YtdlpGui:
             return job.jid in self.cancel_flags or job.jid in self.pause_flags
 
     def _run_job(self, job: Job) -> None:
+        self.batch_active = True
         resuming = job.percent > 0
         job.status = STATUS_RUNNING
         job.error = ""
@@ -2051,6 +2292,15 @@ class YtdlpGui:
 
             if line.startswith(F_TAG):
                 job.filepath = line[len(F_TAG):].strip()
+                continue
+
+            if line.startswith(T_TAG):
+                # Fills in the title of items queued without fetching their info
+                # first, such as a batch of links or a tab scan.
+                title = line[len(T_TAG):].strip()
+                if title and title != "NA" and not job.whole_playlist and not job.title:
+                    job.title = title
+                    self._after(self._update_row, job)
                 continue
 
             collected.append(line)
@@ -2144,6 +2394,11 @@ class YtdlpGui:
             running = [j for j in self.jobs if j.status == STATUS_RUNNING]
             waiting = sum(1 for j in self.jobs if j.status == STATUS_QUEUED)
             held = sum(1 for j in self.jobs if j.status == STATUS_PAUSED)
+        self.notebook.tab(self.queue_tab, text=f"  Queue ({total})  " if total else "  Queue  ")
+        if total == 0:
+            self.empty_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        else:
+            self.empty_label.place_forget()
         if total == 0:
             self.overall_bar["value"] = 0
             self.overall_label_var.set("Queue empty")
@@ -2163,6 +2418,43 @@ class YtdlpGui:
             parts.append(f"{held} paused")
         parts.append(state)
         self.overall_label_var.set(" - ".join(parts))
+
+    def _check_queue_finished(self):
+        """Say so once when the last download of a run has finished."""
+        if not self.batch_active:
+            return
+        with self.run_lock:
+            if self.active:
+                return
+        with self.jobs_lock:
+            if any(j.status == STATUS_PAUSED for j in self.jobs):
+                return  # paused by hand, so the run is not over
+            waiting = any(j.status == STATUS_QUEUED for j in self.jobs)
+            done = sum(1 for j in self.jobs if j.status in (STATUS_DONE, STATUS_SKIPPED))
+            failed = sum(1 for j in self.jobs if j.status == STATUS_FAILED)
+        if waiting and not self.paused:
+            return  # the scheduler is about to start the next one
+        self.batch_active = False
+        message = f"Queue finished - {done} downloaded"
+        if failed:
+            message += f", {failed} failed (F5 retries them)"
+        self.log(message, "warning" if failed else "ok")
+        self.set_status(message)
+        if self.cfg.get("notify_done"):
+            self._notify()
+
+    def _notify(self):
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+        if IS_WINDOWS and self.root.focus_displayof() is None:
+            try:
+                import ctypes
+                hwnd = int(self.root.wm_frame(), 16)
+                ctypes.windll.user32.FlashWindow(hwnd, True)
+            except Exception:
+                pass
 
     # -- yt-dlp maintenance ------------------------------------------------
 
@@ -2223,6 +2515,9 @@ class YtdlpGui:
             "Ctrl+V\tPaste a URL and fetch its info\n"
             "Enter\tFetch info for the URL in the box\n"
             "Ctrl+Enter\tAdd to the queue\n"
+            "Ctrl+M\tAdd many URLs at once\n"
+            "Ctrl+T\tScan browser tabs for video and audio\n"
+            "Ctrl+A\tSelect every queue item\n"
             "Ctrl+O\tChoose the download folder\n"
             "Delete\tRemove the selected queue items\n"
             "F5\tRetry every failed item\n"
@@ -2237,7 +2532,7 @@ class YtdlpGui:
             f"About {APP_NAME}",
             f"{APP_NAME} {APP_VERSION}\n\n"
             "A tkinter front-end for yt-dlp with automatic media inspection,\n"
-            "a persistent download queue and live progress.\n\n"
+            "a persistent download queue, live progress and browser tab scanning.\n\n"
             f"yt-dlp: {self.ytdlp or 'not found'}\n"
             f"ffmpeg: {self.ffmpeg or 'not found'}\n"
             f"App data: {APP_DATA}")
@@ -2264,6 +2559,443 @@ class YtdlpGui:
         save_config(self.cfg)
         self._save_queue()
         self.root.destroy()
+
+
+# --------------------------------------------------------------------------
+# Bulk-add windows
+# --------------------------------------------------------------------------
+
+CHECK_ON = "☑"    # ballot box with check
+CHECK_OFF = "☐"   # ballot box
+CHECK_NA = "–"    # en dash: already queued, nothing to tick
+
+
+class _BulkDialog:
+    """Shared frame for the windows that add many items at once."""
+
+    def __init__(self, app: YtdlpGui, title: str, size: tuple[int, int]):
+        self.app = app
+        self.top = tk.Toplevel(app.root)
+        self.top.title(title)
+        self.top.transient(app.root)
+        self.top.minsize(560, 360)
+        try:
+            scale = max(1.0, float(app.root.tk.call("tk", "scaling")) / 1.3333)
+        except (tk.TclError, ValueError):
+            scale = 1.0
+        width, height = int(size[0] * scale), int(size[1] * scale)
+        x = app.root.winfo_rootx() + max(0, (app.root.winfo_width() - width) // 2)
+        y = app.root.winfo_rooty() + max(0, (app.root.winfo_height() - height) // 3)
+        self.top.geometry(f"{width}x{height}+{x}+{y}")
+        self.top.bind("<Escape>", lambda e: self.close())
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.body = ttk.Frame(self.top, padding=12)
+        self.body.pack(fill=tk.BOTH, expand=True)
+
+    def _build_format_row(self, parent) -> ttk.Frame:
+        """Format and quality for everything this window adds, preset from the main window."""
+        row = ttk.Frame(parent)
+        kind = self.app.kind_var.get()
+        self.kind_var = tk.StringVar(value=kind)
+        self.quality_var = tk.StringVar()
+        ttk.Label(row, text="Format:").pack(side=tk.LEFT)
+        kind_combo = ttk.Combobox(row, textvariable=self.kind_var, values=ALL_KINDS,
+                                  state="readonly", width=12)
+        kind_combo.pack(side=tk.LEFT, padx=(6, 14))
+        ttk.Label(row, text="Quality:").pack(side=tk.LEFT)
+        self.quality_combo = ttk.Combobox(row, textvariable=self.quality_var,
+                                          state="readonly", width=15)
+        self.quality_combo.pack(side=tk.LEFT, padx=(6, 0))
+        kind_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_qualities())
+        self._sync_qualities(strip_size_note(self.app.quality_var.get()))
+        return row
+
+    def _sync_qualities(self, wanted: str | None = None):
+        values = AUDIO_QUALITIES if self.kind_var.get() in AUDIO_KINDS else GENERIC_QUALITIES
+        self.quality_combo.config(values=values)
+        wanted = wanted or self.quality_var.get()
+        self.quality_var.set(wanted if wanted in values else values[0])
+
+    def apply_theme(self):
+        try:
+            self.top.configure(bg=self.app.theme["bg"])
+        except tk.TclError:
+            pass
+
+    def close(self):
+        for attr in ("scan_dialog", "batch_dialog"):
+            if getattr(self.app, attr) is self:
+                setattr(self.app, attr, None)
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
+class TabScanDialog(_BulkDialog):
+    """
+    Lists the video and audio pages open in the user's browsers, all ticked,
+    so the whole lot can be queued with one click.
+    """
+
+    TITLE_LIMIT = 70
+
+    def __init__(self, app: YtdlpGui):
+        super().__init__(app, "Scan browser tabs", (900, 600))
+        self.rows: dict[str, dict] = {}
+        self.results: list[tabscan.BrowserResult] = []
+        self.scan_seq = 0
+
+        cfg = app.cfg
+        self.show_all_var = tk.BooleanVar(value=bool(cfg.get("scan_show_all")))
+        self.include_closed_var = tk.BooleanVar(value=bool(cfg.get("scan_include_closed")))
+        self.summary_var = tk.StringVar(value="Scanning your browsers...")
+        self.detail_var = tk.StringVar(value="")
+
+        head = ttk.Frame(self.body)
+        head.pack(fill=tk.X)
+        head.columnconfigure(0, weight=1)
+        ttk.Label(head, textvariable=self.summary_var, style="Title.TLabel").grid(
+            row=0, column=0, sticky=tk.W)
+        self.progress = ttk.Progressbar(head, mode="indeterminate", length=140)
+        self.progress.grid(row=0, column=1, sticky=tk.E)
+        self.detail_label = ttk.Label(head, textvariable=self.detail_var, style="Muted.TLabel",
+                                      justify=tk.LEFT, wraplength=820)
+        self.detail_label.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+        head.bind("<Configure>", lambda e: self.detail_label.configure(
+            wraplength=max(300, e.width - 10)))
+
+        opts = ttk.Frame(self.body)
+        opts.pack(fill=tk.X, pady=(10, 6))
+        ttk.Checkbutton(opts, text="Show every tab, not only video and audio",
+                        variable=self.show_all_var, command=self._on_show_all).pack(side=tk.LEFT)
+        ttk.Checkbutton(opts, text="Include closed browsers (tabs from their last session)",
+                        variable=self.include_closed_var,
+                        command=self._on_include_closed).pack(side=tk.LEFT, padx=(16, 0))
+
+        bottom = ttk.Frame(self.body)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        self._build_format_row(bottom).pack(side=tk.LEFT)
+        self.add_button = ttk.Button(bottom, text="Add to queue", style="Accent.TButton",
+                                     command=self.add_checked)
+        self.add_button.pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Close", width=9, command=self.close).pack(side=tk.RIGHT, padx=6)
+        self.rescan_button = ttk.Button(bottom, text="Rescan", width=9, command=self.rescan)
+        self.rescan_button.pack(side=tk.RIGHT)
+
+        picks = ttk.Frame(self.body)
+        picks.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Button(picks, text="Tick all", width=9,
+                   command=lambda: self._set_all(True)).pack(side=tk.LEFT)
+        ttk.Button(picks, text="Tick none", width=10,
+                   command=lambda: self._set_all(False)).pack(side=tk.LEFT, padx=4)
+        ttk.Label(picks, text="Click a row to tick or untick it. Tabs opened in the last "
+                              "few seconds may be missing - press Rescan.",
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=(10, 0))
+
+        wrap = ttk.Frame(self.body)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        columns = ("check", "title", "site", "browser")
+        self.tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="extended")
+        for col, text, width, stretch, anchor in (
+                ("check", CHECK_ON, 36, False, tk.CENTER), ("title", "Title", 420, True, tk.W),
+                ("site", "Site", 150, False, tk.W), ("browser", "Browser", 170, False, tk.W)):
+            self.tree.heading(col, text=text, anchor=anchor)
+            self.tree.column(col, width=width, minwidth=width if not stretch else 160,
+                             stretch=stretch, anchor=anchor)
+        self.tree.heading("check", command=self._toggle_all)
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<space>", lambda e: (self._toggle_selection(), "break")[1])
+        self.tree.bind("<Double-1>", lambda e: "break")
+        self.tree.bind("<Control-a>", lambda e: (self.tree.selection_set(
+            self.tree.get_children()), "break")[1])
+        self.top.bind("<Return>", lambda e: self.add_checked())
+        self.top.bind("<F5>", lambda e: self.rescan())
+
+        self.apply_theme()
+        self.rescan()
+
+    # -- scanning ----------------------------------------------------------
+
+    def rescan(self):
+        self.scan_seq += 1
+        seq = self.scan_seq
+        self.summary_var.set("Scanning your browsers...")
+        self.detail_var.set("Reading the session files of Chrome, Brave, Edge, Vivaldi, "
+                            "Opera, Firefox and others.")
+        self.progress.grid()
+        self.progress.start(12)
+        self.rescan_button.config(state=tk.DISABLED)
+        include_closed = self.include_closed_var.get()
+
+        def work():
+            try:
+                results = tabscan.scan_browsers(include_closed=include_closed)
+                error = ""
+            except Exception as exc:  # never leave the window spinning
+                results, error = [], str(exc)
+            self.app._after(self._scan_done, seq, results, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _scan_done(self, seq: int, results: list, error: str):
+        if seq != self.scan_seq or not self.top.winfo_exists():
+            return
+        self.progress.stop()
+        self.progress.grid_remove()
+        self.rescan_button.config(state=tk.NORMAL)
+        self.results = results
+        if error:
+            self.app.log(f"Tab scan failed: {error}", "error")
+        self._populate()
+
+    def _populate(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        known = self.app._queued_keys()
+        seen: set[str] = set()
+        media_rows, other_rows = [], []
+        for result in self.results:
+            for tab in result.tabs:
+                key = tabscan.url_key(tab.url)
+                if key in seen:
+                    continue  # the same page open twice, or in two browsers
+                seen.add(key)
+                media = tabscan.is_media_url(tab.url)
+                row = {"tab": tab, "media": media, "queued": key in known, "checked": False}
+                row["checked"] = media and not row["queued"] and tab.running
+                (media_rows if media else other_rows).append(row)
+
+        rows = media_rows + (other_rows if self.show_all_var.get() else [])
+        for index, row in enumerate(rows):
+            iid = f"r{index}"
+            self.rows[iid] = row
+            self.tree.insert("", tk.END, iid=iid, values=self._values(row), tags=self._tags(row))
+        self._update_summary(len(media_rows), len(media_rows) + len(other_rows))
+        self._update_add_button()
+
+    def _values(self, row: dict) -> tuple:
+        tab = row["tab"]
+        title = tabscan.clean_title(tab.title) or tab.url
+        browser = tab.source if tab.running else f"{tab.source} - closed"
+        if row["queued"]:
+            check, browser = CHECK_NA, "already in the queue"
+        else:
+            check = CHECK_ON if row["checked"] else CHECK_OFF
+        return check, truncate(title, self.TITLE_LIMIT), tabscan.site_name(tab.url), browser
+
+    @staticmethod
+    def _tags(row: dict) -> tuple:
+        if row["queued"]:
+            return ("queued",)
+        return ("media",) if row["media"] else ("other",)
+
+    def _update_summary(self, media: int, total: int):
+        readable = [r for r in self.results if not r.error]
+        browsers = list(dict.fromkeys(r.browser for r in readable))
+        if not self.results:
+            self.summary_var.set("No open browser tabs were found")
+            names = ", ".join(n for n, *_ in tabscan.CHROMIUM_BROWSERS + tabscan.FIREFOX_BROWSERS)
+            closed = ("" if self.include_closed_var.get() else
+                      " Tick 'Include closed browsers' to read the tabs a browser had open "
+                      "when it was last closed.")
+            self.detail_var.set(f"Supported browsers: {names}.{closed}")
+            return
+        where = (", ".join(browsers[:-1]) + " and " + browsers[-1]) if len(browsers) > 1 \
+            else (browsers[0] if browsers else "your browsers")
+        queued = sum(1 for r in self.rows.values() if r["queued"])
+        text = f"{media} of {total} open tab{'s' if total != 1 else ''} in {where} " \
+               f"{'has' if media == 1 else 'have'} video or audio"
+        if queued:
+            text += f" ({queued} already queued)"
+        self.summary_var.set(text)
+
+        parts = []
+        for r in self.results:
+            if r.error:
+                parts.append(f"{r.source}: could not be read ({r.error})")
+                continue
+            count = sum(1 for t in r.tabs if tabscan.is_media_url(t.url))
+            state = "" if r.running else ", closed"
+            parts.append(f"{r.source}: {len(r.tabs)} tabs, {count} media{state}")
+        self.detail_var.set("   ·   ".join(parts))
+
+    # -- ticking -------------------------------------------------------------
+
+    def _refresh_row(self, iid: str):
+        row = self.rows[iid]
+        self.tree.item(iid, values=self._values(row), tags=self._tags(row))
+
+    def _toggle(self, iid: str, value: bool | None = None):
+        row = self.rows.get(iid)
+        if row is None or row["queued"]:
+            return
+        row["checked"] = (not row["checked"]) if value is None else value
+        self._refresh_row(iid)
+
+    def _on_click(self, event):
+        if self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+            return None
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return None
+        self._toggle(iid)
+        self._update_add_button()
+        self.tree.focus(iid)
+        return "break"
+
+    def _toggle_selection(self):
+        for iid in self.tree.selection() or ((self.tree.focus(),) if self.tree.focus() else ()):
+            self._toggle(iid)
+        self._update_add_button()
+
+    def _set_all(self, value: bool):
+        for iid in self.rows:
+            self._toggle(iid, value)
+        self._update_add_button()
+
+    def _toggle_all(self):
+        selectable = [r for r in self.rows.values() if not r["queued"]]
+        self._set_all(not all(r["checked"] for r in selectable) if selectable else False)
+
+    def _checked(self) -> list[dict]:
+        return [self.rows[iid] for iid in self.tree.get_children()
+                if self.rows[iid]["checked"] and not self.rows[iid]["queued"]]
+
+    def _update_add_button(self):
+        count = len(self._checked())
+        self.add_button.config(text=f"Add {count} to queue" if count else "Add to queue",
+                               state=tk.NORMAL if count else tk.DISABLED)
+
+    def _on_show_all(self):
+        self.app.cfg["scan_show_all"] = bool(self.show_all_var.get())
+        save_config(self.app.cfg)
+        self._populate()
+
+    def _on_include_closed(self):
+        self.app.cfg["scan_include_closed"] = bool(self.include_closed_var.get())
+        save_config(self.app.cfg)
+        self.rescan()
+
+    def apply_theme(self):
+        super().apply_theme()
+        theme = self.app.theme
+        self.tree.tag_configure("queued", foreground=theme["muted"])
+        self.tree.tag_configure("other", foreground=theme["muted"])
+        self.tree.tag_configure("media", foreground=theme["fg"])
+
+    # -- adding --------------------------------------------------------------
+
+    def add_checked(self):
+        rows = self._checked()
+        if not rows:
+            return
+        entries = []
+        for row in rows:
+            tab = row["tab"]
+            entries.append((tabscan.canonical_url(tab.url), tabscan.clean_title(tab.title),
+                            tabscan.is_playlist_url(tab.url)))
+        added, skipped = self.app.queue_entries(
+            entries, self.kind_var.get(), self.quality_var.get(), source="browser tabs")
+        if added or skipped:
+            self.close()
+
+
+class BatchDialog(_BulkDialog):
+    """A text box for a whole list of links, or any text that contains them."""
+
+    def __init__(self, app: YtdlpGui, text: str = ""):
+        super().__init__(app, "Add many URLs", (720, 480))
+        self.count_var = tk.StringVar(value="")
+
+        ttk.Label(self.body, text="Paste links below - one per line, or any text that "
+                                  "contains them. Duplicates and links already in the "
+                                  "queue are skipped.",
+                  style="Muted.TLabel", wraplength=660, justify=tk.LEFT).pack(anchor=tk.W)
+
+        bottom = ttk.Frame(self.body)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        self._build_format_row(bottom).pack(side=tk.LEFT)
+        self.add_button = ttk.Button(bottom, text="Add to queue", style="Accent.TButton",
+                                     command=self.add)
+        self.add_button.pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Close", width=9, command=self.close).pack(side=tk.RIGHT, padx=6)
+
+        info = ttk.Frame(self.body)
+        info.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Label(info, textvariable=self.count_var).pack(side=tk.LEFT)
+        ttk.Button(info, text="Paste", width=8, command=self.paste).pack(side=tk.RIGHT)
+        ttk.Button(info, text="Clear", width=8,
+                   command=lambda: self.text.delete("1.0", tk.END)).pack(side=tk.RIGHT, padx=4)
+
+        wrap = ttk.Frame(self.body)
+        wrap.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.text = tk.Text(wrap, wrap=tk.NONE, undo=True, font=("Consolas", 10),
+                            relief="flat", borderwidth=0, padx=6, pady=4)
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.text.yview)
+        self.text.configure(yscrollcommand=vsb.set)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<Control-Return>", lambda e: (self.add(), "break")[1])
+
+        self.apply_theme()
+        if text:
+            self.append_text(text)
+        self._update_count()
+        self.text.focus_set()
+
+    def append_text(self, text: str):
+        current = self.text.get("1.0", tk.END).strip()
+        self.text.insert(tk.END, ("\n" if current else "") + text.strip() + "\n")
+        self.text.see(tk.END)
+
+    def paste(self):
+        try:
+            self.append_text(self.app.root.clipboard_get())
+        except tk.TclError:
+            pass
+
+    def _urls(self) -> list[str]:
+        return split_urls(self.text.get("1.0", tk.END))
+
+    def _on_modified(self, _event=None):
+        self.text.edit_modified(False)
+        self._update_count()
+
+    def _update_count(self):
+        urls = self._urls()
+        known = self.app._queued_keys()
+        fresh = len({tabscan.url_key(u) for u in urls} - known)
+        if not urls:
+            self.count_var.set("No links found yet.")
+        elif fresh == len(urls):
+            self.count_var.set(f"{len(urls)} link{'s' if len(urls) != 1 else ''} found.")
+        else:
+            self.count_var.set(f"{len(urls)} links found, {len(urls) - fresh} already in the queue.")
+        self.add_button.config(text=f"Add {fresh} to queue" if fresh else "Add to queue",
+                               state=tk.NORMAL if fresh else tk.DISABLED)
+
+    def apply_theme(self):
+        super().apply_theme()
+        theme = self.app.theme
+        self.text.configure(bg=theme["field"], fg=theme["field_fg"],
+                            insertbackground=theme["field_fg"], selectbackground=theme["sel"])
+
+    def add(self):
+        urls = self._urls()
+        if not urls:
+            return
+        entries = [(tabscan.canonical_url(u), "", tabscan.is_playlist_url(u)) for u in urls]
+        added, skipped = self.app.queue_entries(
+            entries, self.kind_var.get(), self.quality_var.get(), source="the list")
+        if added or skipped:
+            self.close()
 
 
 # --------------------------------------------------------------------------
