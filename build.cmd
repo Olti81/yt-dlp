@@ -1,9 +1,13 @@
 @echo off
-rem Rebuild dist\yt-dlp-gui-<version>.exe from source.
-rem Double-click it, or run "build.cmd" from a terminal in this folder.
-rem   build.cmd           pull the latest code, update the build environment, test, build
-rem   build.cmd nopause   same, but do not wait for a key at the end
-rem   set YTDLP_NO_PULL=1 build without pulling (for testing local changes)
+rem Rebuild the app as a single .exe in dist\.
+rem Double-click it, or run it from a terminal in this folder.
+rem   build.cmd            pull the latest code, test, build the current version
+rem   build.cmd 2.0        build an older release (any git tag, e.g. v2.0) - see "git tag"
+rem   build.cmd nopause    do not wait for a key at the end (combines with a version)
+rem   set YTDLP_NO_PULL=1  build without pulling first (for testing local changes)
+rem
+rem Builds are never deleted: if dist\ already has an .exe of the version being
+rem built, it is moved to dist\previous\ with a timestamp first.
 
 setlocal
 cd /d "%~dp0"
@@ -32,6 +36,18 @@ if not defined YTDLP_PULLED if not defined YTDLP_NO_PULL (
     call "%~f0" %*
     exit /b
 )
+
+rem -- Arguments: "nopause" and/or a version to build
+set "NOPAUSE="
+set "WANT="
+for %%A in (%*) do (
+    if /i "%%~A"=="nopause" (
+        set "NOPAUSE=1"
+    ) else (
+        set "WANT=%%~A"
+    )
+)
+if defined WANT if /i not "%WANT:~0,1%"=="v" set "WANT=v%WANT%"
 
 rem -- Python: the py launcher picks 3.13 if it is installed, else plain python
 set "PY="
@@ -64,17 +80,6 @@ if not exist ".venv\Scripts\python.exe" (
 echo Updating PyInstaller ...
 ".venv\Scripts\python.exe" -m pip install --quiet --upgrade pip pyinstaller || goto :fail
 
-echo Running tests ...
-".venv\Scripts\python.exe" -m unittest discover -s tests -q || goto :fail
-
-rem -- A running copy of the app keeps its .exe locked, and PyInstaller would
-rem    only fail at the very end trying to overwrite it
-if exist "dist\yt-dlp-gui-*.exe" del /q "dist\yt-dlp-gui-*.exe" >nul 2>&1
-if exist "dist\yt-dlp-gui-*.exe" (
-    echo The old dist\yt-dlp-gui .exe is in use. Close the app and run the build again.
-    goto :fail
-)
-
 rem -- Build in a fresh folder in the temp directory. PyInstaller has to delete its old
 rem    work folder first, and Windows refuses while anything still has a file
 rem    open in it - antivirus scanning new files, an Explorer window, the
@@ -85,18 +90,93 @@ if exist "%WORK%" set "WORK=%TEMP%\yt-dlp-gui-build-%RANDOM%%RANDOM%"
 rem    The work folder older versions of this script left in the project
 if exist "build" rmdir /s /q "build" >nul 2>&1
 
-echo Building ...
-".venv\Scripts\python.exe" -m PyInstaller main.spec --noconfirm --workpath "%WORK%" || goto :fail
-if exist "%WORK%" rmdir /s /q "%WORK%" >nul 2>&1
+if defined WANT goto :build_release
 
+rem ---------------------------------------------------------------- current
+echo Running tests ...
+".venv\Scripts\python.exe" -m unittest discover -s tests -q || goto :fail
+
+call :exe_name "main.spec" || goto :fail
+call :keep_old_build || goto :fail
+
+echo Building %EXENAME% ...
+".venv\Scripts\python.exe" -m PyInstaller main.spec --noconfirm --workpath "%WORK%" || goto :fail
+goto :done
+
+rem ---------------------------------------------------------------- release
+rem   The release's files are exported from git into a temp folder (plus a
+rem   copy of resources\), built there into this folder's dist\, and the temp
+rem   folder is removed again. Your checkout is not touched.
+:build_release
+git fetch --tags --quiet >nul 2>&1
+git rev-parse --verify --quiet "%WANT%^{commit}" >nul
+if errorlevel 1 (
+    echo There is no version %WANT%. Versions you can build:
+    git tag -l "v*"
+    goto :fail
+)
+set "SRC=%TEMP%\yt-dlp-gui-src-%WANT%"
+if exist "%SRC%" rmdir /s /q "%SRC%" >nul 2>&1
+if exist "%SRC%" set "SRC=%TEMP%\yt-dlp-gui-src-%WANT%-%RANDOM%%RANDOM%"
+mkdir "%SRC%" || goto :fail
+echo Exporting %WANT% ...
+git archive --format=tar -o "%SRC%\source.tar" "%WANT%" || goto :fail
+tar -xf "%SRC%\source.tar" -C "%SRC%" || goto :fail
+del "%SRC%\source.tar"
+echo Copying resources ...
+robocopy "resources" "%SRC%\resources" /E /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 goto :fail
+
+call :exe_name "%SRC%\main.spec" || goto :fail
+call :keep_old_build || goto :fail
+
+echo Building %EXENAME% ...
+pushd "%SRC%"
+"%~dp0.venv\Scripts\python.exe" -m PyInstaller main.spec --noconfirm --workpath "%WORK%" --distpath "%~dp0dist"
+set "RC=%ERRORLEVEL%"
+popd
+rmdir /s /q "%SRC%" >nul 2>&1
+if not "%RC%"=="0" goto :fail
+goto :done
+
+rem ---------------------------------------------------------------- end
+:done
+if exist "%WORK%" rmdir /s /q "%WORK%" >nul 2>&1
 echo.
 echo Done:
-for %%F in (dist\yt-dlp-gui-*.exe) do echo   %%~fF   (%%~zF bytes)
-if /i not "%~1"=="nopause" pause
+for %%F in ("dist\%EXENAME%.exe") do if exist "%%~fF" echo   %%~fF  -  %%~zF bytes
+if not defined NOPAUSE pause
 exit /b 0
 
 :fail
 echo.
 echo Build FAILED.
-if /i not "%~1"=="nopause" pause
+if not defined NOPAUSE pause
 exit /b 1
+
+rem ---------------------------------------------------------------- helpers
+
+rem   :exe_name <spec>  ->  EXENAME, e.g. yt-dlp-gui-2.1, from the spec's name='...'
+:exe_name
+set "EXENAME="
+for /f "usebackq tokens=2 delims='" %%N in (`findstr /c:"name='" "%~1"`) do set "EXENAME=%%N"
+if defined EXENAME exit /b 0
+echo Could not find the program name in %~1
+exit /b 1
+
+rem   :keep_old_build  ->  moves an existing dist\EXENAME.exe to dist\previous\
+rem   with a timestamp, so a new build never destroys an older one. If it cannot
+rem   be moved, the app is still running.
+:keep_old_build
+if not exist "dist\%EXENAME%.exe" exit /b 0
+if not exist "dist\previous" mkdir "dist\previous"
+set "STAMP="
+for /f %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%T"
+if not defined STAMP set "STAMP=%RANDOM%%RANDOM%"
+move "dist\%EXENAME%.exe" "dist\previous\%EXENAME%-%STAMP%.exe" >nul 2>&1
+if exist "dist\%EXENAME%.exe" (
+    echo dist\%EXENAME%.exe is in use. Close the app and run the build again.
+    exit /b 1
+)
+echo Kept the previous build as dist\previous\%EXENAME%-%STAMP%.exe
+exit /b 0
