@@ -24,11 +24,11 @@ import json
 import os
 import platform
 import re
-import shutil
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -45,6 +45,7 @@ class BrowserTab:
     url: str
     title: str
     running: bool         # False: read from the last session of a closed browser
+    from_history: bool = False   # a recent visit, listed because the tabs were unreadable
 
     @property
     def source(self) -> str:
@@ -59,6 +60,7 @@ class BrowserResult:
     running: bool
     tabs: list[BrowserTab]
     error: str = ""
+    history_hours: int = 0   # >0: open tabs were unreadable, recent history used instead
 
     @property
     def source(self) -> str:
@@ -134,6 +136,56 @@ FIREFOX_BROWSERS = [
     ("Floorp", ("floorp.exe", "floorp"), _platform_dirs(
         [("APPDATA", "Floorp/Profiles")], ["Floorp/Profiles"], [".floorp"])),
 ]
+
+
+# --------------------------------------------------------------------------
+# Reading files the browser has open
+# --------------------------------------------------------------------------
+
+def read_shared(path: Path) -> bytes:
+    """
+    Read a file that a running browser holds open.
+
+    Chromium opens its session and history files with delete access, and on
+    Windows a second opener is refused (a sharing violation, which Python
+    reports as "Permission denied") unless it also allows FILE_SHARE_DELETE.
+    Python's open() never does, so the file is opened through CreateFileW with
+    every share flag set instead.
+    """
+    if not IS_WINDOWS:
+        return Path(path).read_bytes()
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+
+    generic_read = 0x80000000
+    share_all = 0x1 | 0x2 | 0x4          # FILE_SHARE_READ | WRITE | DELETE
+    open_existing = 3
+    attribute_normal = 0x80
+    handle = create_file(str(path), generic_read, share_all, None, open_existing,
+                         attribute_normal, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        code = ctypes.get_last_error()
+        if code == 32:  # ERROR_SHARING_VIOLATION
+            raise OSError(code, "the browser has the file locked")
+        raise OSError(code, ctypes.FormatError(code).strip(), str(path))
+    fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def describe_error(exc: Exception) -> str:
+    """A short reason for the scan window, without the full file path."""
+    if isinstance(exc, OSError) and exc.strerror:
+        return exc.strerror
+    return str(exc) or exc.__class__.__name__
 
 
 # --------------------------------------------------------------------------
@@ -308,38 +360,58 @@ def latest_session_file(profile_dir: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
+def _query_history(profile_dir: Path, sql: str, params: list) -> list[tuple]:
+    """
+    Run a query on a copy of a Chromium profile's History database (the
+    original is locked while the browser runs). Returns [] if it cannot be read.
+    """
+    source = profile_dir / "History"
+    if not source.is_file():
+        return []
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "History"
+        try:
+            copy.write_bytes(read_shared(source))
+            conn = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        except (OSError, sqlite3.Error):
+            return []
+        try:
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+
 def history_titles(profile_dir: Path, urls: list[str]) -> dict[str, str]:
     """
     Page titles from the browser history, for tabs whose title the session file
     does not have yet (Chromium writes a tab's title to it some time after the
-    page has loaded). The database is locked while the browser runs, so a copy
-    is read instead.
+    page has loaded).
     """
-    source = profile_dir / "History"
-    wanted = list(dict.fromkeys(u for u in urls if u))
-    if not wanted or not source.is_file():
+    wanted = list(dict.fromkeys(u for u in urls if u))[:900]  # SQLite's parameter limit
+    if not wanted:
         return {}
-    titles: dict[str, str] = {}
-    with tempfile.TemporaryDirectory() as tmp:
-        copy = Path(tmp) / "History"
-        try:
-            shutil.copyfile(source, copy)
-            conn = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
-        except (OSError, sqlite3.Error):
-            return {}
-        try:
-            for start in range(0, len(wanted), 500):
-                chunk = wanted[start:start + 500]
-                marks = ",".join("?" * len(chunk))
-                for url, title in conn.execute(
-                        f"SELECT url, title FROM urls WHERE url IN ({marks})", chunk):
-                    if title:
-                        titles[url] = title
-        except sqlite3.Error:
-            pass
-        finally:
-            conn.close()
-    return titles
+    marks = ",".join("?" * len(wanted))
+    rows = _query_history(profile_dir, f"SELECT url, title FROM urls WHERE url IN ({marks})", wanted)
+    return {url: title for url, title in rows if title}
+
+
+# Chromium stores times as microseconds since 1601-01-01.
+_CHROME_EPOCH_OFFSET = 11644473600
+
+
+def recent_media_pages(profile_dir: Path, hours: int, limit: int = 300) -> list[tuple[str, str]]:
+    """
+    Video and audio pages visited in the last `hours`, newest first: the
+    stand-in for the open tabs when the session file cannot be read.
+    """
+    cutoff = int((time.time() + _CHROME_EPOCH_OFFSET - hours * 3600) * 1_000_000)
+    rows = _query_history(
+        profile_dir,
+        "SELECT url, title FROM urls WHERE last_visit_time > ? "
+        "ORDER BY last_visit_time DESC LIMIT ?", [cutoff, limit * 10])
+    return [(url, title) for url, title in rows if is_media_url(url)][:limit]
 
 
 def chromium_profiles(user_data: Path) -> list[tuple[str, Path]]:
@@ -490,6 +562,9 @@ def _usable(url: str) -> bool:
     return url.lower().startswith(("http://", "https://"))
 
 
+HISTORY_FALLBACK_HOURS = 24
+
+
 def scan_browsers(include_closed: bool = False,
                   chromium: list | None = None,
                   firefox: list | None = None) -> list[BrowserResult]:
@@ -513,14 +588,27 @@ def scan_browsers(include_closed: bool = False,
                 result = BrowserResult(name, profile, running, [])
                 try:
                     session = latest_session_file(directory)
-                    pages = [(u, t) for u, t in parse_snss(session.read_bytes()) if _usable(u)]
+                    try:
+                        data = read_shared(session)
+                    except OSError:
+                        if not running:
+                            raise
+                        # Some Chromium builds hold the live session file
+                        # exclusively. The history still says what was opened.
+                        result.history_hours = HISTORY_FALLBACK_HOURS
+                        for url, title in recent_media_pages(directory, HISTORY_FALLBACK_HOURS):
+                            result.tabs.append(BrowserTab(name, profile, url, title, running,
+                                                          from_history=True))
+                        results.append(result)
+                        continue
+                    pages = [(u, t) for u, t in parse_snss(data) if _usable(u)]
                     missing = [u for u, t in pages if not t]
                     known = history_titles(directory, missing) if missing else {}
                     for url, title in pages:
                         result.tabs.append(BrowserTab(name, profile, url,
                                                       title or known.get(url, ""), running))
                 except Exception as exc:
-                    result.error = str(exc) or exc.__class__.__name__
+                    result.error = describe_error(exc)
                 results.append(result)
 
     for name, exes, roots in (FIREFOX_BROWSERS if firefox is None else firefox):
@@ -532,12 +620,12 @@ def scan_browsers(include_closed: bool = False,
                 result = BrowserResult(name, profile, running, [])
                 try:
                     path = firefox_session_file(directory, running)
-                    session = json.loads(read_mozlz4(path.read_bytes()))
+                    session = json.loads(read_mozlz4(read_shared(path)))
                     for url, title in parse_firefox_session(session):
                         if _usable(url):
                             result.tabs.append(BrowserTab(name, profile, url, title, running))
                 except Exception as exc:
-                    result.error = str(exc) or exc.__class__.__name__
+                    result.error = describe_error(exc)
                 results.append(result)
 
     return results

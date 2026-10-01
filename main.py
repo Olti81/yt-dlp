@@ -2768,7 +2768,8 @@ class TabScanDialog(_BulkDialog):
                 seen.add(key)
                 media = tabscan.is_media_url(tab.url)
                 row = {"tab": tab, "media": media, "queued": key in known, "checked": False}
-                row["checked"] = media and not row["queued"] and tab.running
+                row["checked"] = (media and not row["queued"] and tab.running
+                                  and not tab.from_history)
                 (media_rows if media else other_rows).append(row)
 
         rows = media_rows + (other_rows if self.show_all_var.get() else [])
@@ -2782,7 +2783,12 @@ class TabScanDialog(_BulkDialog):
     def _values(self, row: dict) -> tuple:
         tab = row["tab"]
         title = tabscan.clean_title(tab.title) or tab.url
-        browser = tab.source if tab.running else f"{tab.source} - closed"
+        if tab.from_history:
+            browser = f"{tab.source} - history"
+        elif tab.running:
+            browser = tab.source
+        else:
+            browser = f"{tab.source} - closed"
         if row["queued"]:
             check, browser = CHECK_NA, "already in the queue"
         else:
@@ -2806,14 +2812,27 @@ class TabScanDialog(_BulkDialog):
                       "when it was last closed.")
             self.detail_var.set(f"Supported browsers: {names}.{closed}")
             return
+        if not readable:
+            failed = list(dict.fromkeys(r.browser for r in self.results))
+            self.summary_var.set("Could not read the open tabs of " + (
+                ", ".join(failed[:-1]) + " and " + failed[-1] if len(failed) > 1 else failed[0]))
         where = (", ".join(browsers[:-1]) + " and " + browsers[-1]) if len(browsers) > 1 \
             else (browsers[0] if browsers else "your browsers")
         queued = sum(1 for r in self.rows.values() if r["queued"])
-        text = f"{media} of {total} open tab{'s' if total != 1 else ''} in {where} " \
-               f"{'has' if media == 1 else 'have'} video or audio"
+        recent = sum(1 for r in self.rows.values() if r["tab"].from_history)
+        opened = media - recent
+        total -= recent
+        text = f"{opened} of {total} open tab{'s' if total != 1 else ''} in {where} " \
+               f"{'has' if opened == 1 else 'have'} video or audio"
+        if recent and not total:
+            text = (f"Open tabs in {where} could not be read - {recent} video "
+                    f"page{'s' if recent != 1 else ''} visited recently are listed instead")
+        elif recent:
+            text += f", plus {recent} recently visited"
         if queued:
             text += f" ({queued} already queued)"
-        self.summary_var.set(text)
+        if readable:
+            self.summary_var.set(text)
 
         parts = []
         for r in self.results:
@@ -2821,6 +2840,11 @@ class TabScanDialog(_BulkDialog):
                 parts.append(f"{r.source}: could not be read ({r.error})")
                 continue
             count = sum(1 for t in r.tabs if tabscan.is_media_url(t.url))
+            if r.history_hours:
+                parts.append(f"{r.source}: open tabs are locked by the browser - showing {count} "
+                             f"video pages from the last {r.history_hours} hours of history "
+                             "(not ticked)")
+                continue
             state = "" if r.running else ", closed"
             parts.append(f"{r.source}: {len(r.tabs)} tabs, {count} media{state}")
         self.detail_var.set("   ·   ".join(parts))

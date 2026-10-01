@@ -101,6 +101,44 @@ class ChromiumSessionTests(unittest.TestCase):
             self.assertEqual(results, [])
 
 
+class LockedSessionTests(unittest.TestCase):
+    def test_history_fallback_when_session_is_locked(self):
+        import sqlite3
+        import time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "Default"
+            (profile / "Sessions").mkdir(parents=True)
+            shutil.copy(DATA / "chromium_session.snss", profile / "Sessions" / "Session_1")
+            now = int((time.time() + 11644473600) * 1_000_000)
+            old = now - 3 * 86400 * 1_000_000
+            conn = sqlite3.connect(profile / "History")
+            conn.execute("CREATE TABLE urls (url TEXT, title TEXT, last_visit_time INTEGER)")
+            conn.executemany("INSERT INTO urls VALUES (?, ?, ?)", [
+                ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Recent video - YouTube", now),
+                ("https://github.com/yt-dlp/yt-dlp", "Not media", now),
+                ("https://vimeo.com/76979871", "Too old", old)])
+            conn.commit()
+            conn.close()
+
+            real = tabscan.read_shared
+
+            def locked(path):
+                if "Session_" in str(path):
+                    raise PermissionError(13, "the browser has the file locked")
+                return real(path)
+
+            with mock.patch.object(tabscan, "read_shared", side_effect=locked), \
+                    mock.patch.object(tabscan, "running_process_names", return_value={"brave"}):
+                results = tabscan.scan_browsers(
+                    firefox=[], chromium=[("Brave", ("brave",), [Path(tmp)])])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].error, "")
+        self.assertTrue(results[0].history_hours)
+        self.assertEqual([(t.url, t.from_history) for t in results[0].tabs],
+                         [("https://www.youtube.com/watch?v=dQw4w9WgXcQ", True)])
+
+
 class FirefoxSessionTests(unittest.TestCase):
     def test_lz4_session(self):
         raw = tabscan.read_mozlz4((DATA / "firefox_recovery.jsonlz4").read_bytes())
