@@ -49,8 +49,11 @@ for %%A in (%*) do (
     )
 )
 rem    "2.0" means the tag v2.0; a commit id such as 450382c works too
+rem    (%WANT:~0,1% must not be expanded when WANT is empty - it breaks the line)
 set "WANT_RAW=%WANT%"
-if defined WANT if /i not "%WANT:~0,1%"=="v" set "WANT=v%WANT%"
+if not defined WANT goto :want_done
+if /i not "%WANT:~0,1%"=="v" set "WANT=v%WANT%"
+:want_done
 
 rem -- Python: the py launcher picks 3.13 if it is installed, else plain python
 set "PY="
