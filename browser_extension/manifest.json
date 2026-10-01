@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "yt-dlp Downloader - tab reporter",
+  "version": "1.0",
+  "description": "Tells the yt-dlp Downloader app on this computer which tabs are open, so 'Scan browser tabs' can queue their videos. Nothing leaves this computer.",
+  "permissions": ["tabs", "alarms", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}

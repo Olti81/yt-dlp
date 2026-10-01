@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-yt-dlp Downloader 2.1
+yt-dlp Downloader 2.2
 =====================
 
 A tkinter front-end for yt-dlp with automatic media inspection, a persistent
@@ -31,10 +31,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import tabbridge
 import tabscan
 
 APP_NAME = "yt-dlp Downloader"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 IS_WINDOWS = platform.system() == "Windows"
 
 # Sentinels used to pick our own machine-readable lines out of yt-dlp's output.
@@ -122,6 +123,10 @@ ARCHIVE_FILE = APP_DATA / "archive.txt"
 BIN_DIR = APP_DATA / "bin"
 BIN_STAMP = BIN_DIR / "source.json"
 THUMB_DIR = APP_DATA / "thumbs"
+# The companion extension is copied here, to a folder that stays put, so the
+# browser can load it "unpacked" (the .exe unpacks itself to a new temp folder
+# every run).
+EXTENSION_DIR = APP_DATA / "browser-extension"
 
 
 def default_download_dir() -> str:
@@ -246,6 +251,53 @@ def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
 
 
+def join_names(names: list[str]) -> str:
+    """['Chrome', 'Brave', 'Edge'] -> 'Chrome, Brave and Edge'."""
+    names = list(names)
+    return ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else "".join(names)
+
+
+def install_extension_files() -> Path:
+    """Copy the bundled companion extension to EXTENSION_DIR, updating changed files."""
+    source = bundle_dir() / "browser_extension"
+    try:
+        EXTENSION_DIR.mkdir(parents=True, exist_ok=True)
+        for item in source.iterdir():
+            target = EXTENSION_DIR / item.name
+            data = item.read_bytes()
+            if not target.is_file() or target.read_bytes() != data:
+                target.write_bytes(data)
+    except OSError:
+        pass
+    return EXTENSION_DIR
+
+
+# (name, executable, page that lists the extensions)
+EXTENSION_BROWSERS = [
+    ("Chrome", "chrome.exe", "chrome://extensions/"),
+    ("Brave", "brave.exe", "brave://extensions/"),
+    ("Edge", "msedge.exe", "edge://extensions/"),
+]
+
+
+def find_browser_exe(exe: str) -> str | None:
+    """Where a browser is installed, from the registry's App Paths, or None."""
+    if not IS_WINDOWS:
+        return shutil.which(exe.removesuffix(".exe"))
+    import winreg
+    key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, key_path) as key:
+                value = winreg.QueryValue(key, None)
+        except OSError:
+            continue
+        value = value.strip().strip('"')
+        if value and Path(value).is_file():
+            return value
+    return None
+
+
 def open_in_explorer(path: str, select: bool = False):
     p = Path(path)
     try:
@@ -344,6 +396,7 @@ DEFAULT_CONFIG = {
     "notify_done": True,
     "scan_show_all": False,
     "scan_include_closed": False,
+    "extension_browsers": [],   # browsers whose companion extension has reported
     "subtitles": False,
     "sub_langs": "en",
     "auto_subs": False,
@@ -485,6 +538,13 @@ class YtdlpGui:
         self.save_after_id = None
         self.scan_dialog: TabScanDialog | None = None
         self.batch_dialog: BatchDialog | None = None
+        self.extension_dialog: ExtensionDialog | None = None
+        self.scanning = False
+
+        # Receives the open tabs from the companion browser extension.
+        self.bridge = tabbridge.TabBridge()
+        self.bridge.start()
+        install_extension_files()
 
         self.ytdlp, notes = resolve_ytdlp()
         self.ffmpeg = resolve_ffmpeg()
@@ -573,7 +633,10 @@ class YtdlpGui:
         m_file.add_command(label="Fetch media info\tEnter", command=self.probe_now)
         m_file.add_command(label="Add to queue\tCtrl+Enter", command=self.add_to_queue)
         m_file.add_command(label="Add many URLs...\tCtrl+M", command=self.open_batch_dialog)
-        m_file.add_command(label="Scan browser tabs...\tCtrl+T", command=self.open_scan_dialog)
+        m_file.add_command(label="Scan browser tabs and queue videos\tCtrl+T",
+                           command=self.scan_and_queue)
+        m_file.add_command(label="Choose browser tabs to queue...\tCtrl+Shift+T",
+                           command=self.open_scan_dialog)
         m_file.add_separator()
         m_file.add_command(label="Choose download folder...\tCtrl+O", command=self.browse_dir)
         m_file.add_command(label="Open download folder", command=lambda: open_in_explorer(self.dir_var.get()))
@@ -601,6 +664,8 @@ class YtdlpGui:
 
         m_tools = tk.Menu(menubar, tearoff=0)
         m_tools.add_command(label="Update yt-dlp now", command=self.update_ytdlp)
+        m_tools.add_command(label="Set up browser extension...",
+                            command=self.open_extension_dialog)
         m_tools.add_command(label="Open app data folder", command=lambda: open_in_explorer(str(APP_DATA)))
         m_tools.add_separator()
         m_tools.add_command(label="Clear download archive", command=self.clear_archive)
@@ -615,7 +680,8 @@ class YtdlpGui:
         self.root.config(menu=menubar)
 
         self.root.bind("<Control-v>", self._on_ctrl_v)
-        self.root.bind("<Control-t>", lambda e: self.open_scan_dialog())
+        self.root.bind("<Control-t>", lambda e: self.scan_and_queue())
+        self.root.bind("<Control-T>", lambda e: self.open_scan_dialog())
         self.root.bind("<Control-m>", lambda e: (self.open_batch_dialog(), "break")[1])
         self.root.bind("<Control-o>", lambda e: self.browse_dir())
         self.root.bind("<Control-l>", lambda e: self.clear_log())
@@ -669,7 +735,7 @@ class YtdlpGui:
                                        command=self.open_batch_dialog)
         self.batch_button.grid(row=0, column=5, padx=2)
         self.scan_button = ttk.Button(row, text="Scan browser tabs", style="Accent.TButton",
-                                      command=self.open_scan_dialog)
+                                      command=self.scan_and_queue)
         self.scan_button.grid(row=0, column=6, padx=(2, 0))
 
         status_row = ttk.Frame(frame)
@@ -1077,7 +1143,7 @@ class YtdlpGui:
 
         self.thumb_label.configure(bg=panel, fg=muted, highlightbackground=border)
         self.empty_label.configure(bg=panel, fg=muted)
-        for dialog in (self.scan_dialog, self.batch_dialog):
+        for dialog in (self.scan_dialog, self.batch_dialog, self.extension_dialog):
             if dialog is not None:
                 try:
                     dialog.apply_theme()
@@ -1607,6 +1673,125 @@ class YtdlpGui:
             self.scan_dialog.rescan()
             return
         self.scan_dialog = TabScanDialog(self)
+
+    # -- browser tabs --------------------------------------------------------
+
+    # The extension reports every 30 seconds, so right after the app starts a
+    # browser may not have reported yet; a scan then waits up to this long.
+    EXTENSION_STARTUP_WAIT = 35
+
+    def gather_tabs(self, include_closed: bool, on_wait=None) -> list[tabscan.BrowserResult]:
+        """
+        Scan the browsers (call from a worker thread). Live tabs from the
+        companion extension are used where it is installed; if a browser it has
+        reported from before is running but has not reported since the app
+        started, wait for it briefly first. `on_wait(names)` is told who.
+        """
+        if self.bridge.listening:
+            expected = (tabscan.running_chromium_browsers()
+                        & set(self.cfg.get("extension_browsers") or []))
+            missing = expected - self.bridge.browsers()
+            until = self.bridge.started + self.EXTENSION_STARTUP_WAIT
+            if missing and time.monotonic() < until:
+                if on_wait:
+                    on_wait(sorted(missing))
+                self.bridge.wait_for(missing, until)
+        return tabscan.scan_browsers(include_closed=include_closed,
+                                     live=self.bridge.snapshots())
+
+    def remember_extension_browsers(self, results: list[tabscan.BrowserResult]):
+        seen = set(self.cfg.get("extension_browsers") or [])
+        now = seen | {r.browser for r in results if r.via_extension}
+        if now != seen:
+            self.cfg["extension_browsers"] = sorted(now)
+            save_config(self.cfg)
+
+    def scan_and_queue(self):
+        """The 'Scan browser tabs' button: queue every video and audio tab, no questions."""
+        if self.scanning:
+            return
+        self.scanning = True
+        self.scan_button.config(state=tk.DISABLED, text="Scanning...")
+        self.set_status("Scanning your browsers for video and audio tabs...")
+
+        def waiting(names):
+            self.set_status(f"Waiting for the browser extension in {join_names(names)} "
+                            "to report its tabs...")
+
+        def work():
+            try:
+                results, error = self.gather_tabs(False, waiting), ""
+            except Exception as exc:  # never leave the button stuck
+                results, error = [], str(exc)
+            self._after(self._scan_and_queue_done, results, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _scan_and_queue_done(self, results: list[tabscan.BrowserResult], error: str):
+        self.scanning = False
+        self.scan_button.config(state=tk.NORMAL, text="Scan browser tabs")
+        if error:
+            self.log(f"Tab scan failed: {error}", "error")
+            self.set_status("The tab scan failed - see the log.")
+            return
+        self.remember_extension_browsers(results)
+
+        entries, seen = [], set()
+        for result in results:
+            for tab in result.tabs:
+                if tab.from_history or not tab.running or not tabscan.is_media_url(tab.url):
+                    continue
+                key = tabscan.url_key(tab.url)
+                if key in seen:
+                    continue  # the same video open twice, or in two browsers
+                seen.add(key)
+                entries.append((tabscan.canonical_url(tab.url), tabscan.clean_title(tab.title),
+                                tabscan.is_playlist_url(tab.url)))
+
+        read = [r for r in results if not r.error and not r.history_hours]
+        locked = list(dict.fromkeys(r.browser for r in results if r.history_hours))
+        for r in results:
+            if r.error:
+                self.log(f"{r.source}: the open tabs could not be read ({r.error}).", "warning")
+        for name in locked:
+            self.log(f"{name}: the browser keeps its open tabs locked. Install the companion "
+                     "extension to scan it: Tools > Set up browser extension.", "warning")
+
+        where = join_names(list(dict.fromkeys(r.browser for r in read))) or "your browsers"
+        if entries:
+            kind, quality = self.kind_var.get(), strip_size_note(self.quality_var.get())
+            added, skipped = self.queue_entries(entries, kind, quality, source="browser tabs")
+            if added or skipped:
+                text = f"Added {added} video and audio tab{'s' if added != 1 else ''} from {where}"
+                if skipped:
+                    text += f" ({skipped} already in the queue)"
+                self.set_status(text + ".")
+        elif read:
+            tabs = sum(len(r.tabs) for r in read)
+            self.set_status(f"None of the {tabs} tab{'s' if tabs != 1 else ''} open in {where} "
+                            "has video or audio.")
+        elif not results:
+            self.set_status("No running browser was found. Open your browser and try again.")
+        else:
+            self.set_status(f"Could not read the open tabs of {join_names(locked) or where}.")
+
+        if locked and not entries:
+            if messagebox.askyesno(
+                    APP_NAME,
+                    f"{join_names(locked)} keep{'s' if len(locked) == 1 else ''} the list of open "
+                    "tabs locked while running, so the app cannot read it.\n\n"
+                    "A small companion extension fixes that: it tells this app which tabs "
+                    "are open (nothing leaves your computer). It takes a minute to install, "
+                    "once per browser.\n\nSet it up now?"):
+                self.open_extension_dialog()
+
+    def open_extension_dialog(self):
+        if self.extension_dialog is not None:
+            self.extension_dialog.top.deiconify()
+            self.extension_dialog.top.lift()
+            return
+        install_extension_files()
+        self.extension_dialog = ExtensionDialog(self)
 
     def open_batch_dialog(self, text: str = ""):
         if self.batch_dialog is not None:
@@ -2516,7 +2701,8 @@ class YtdlpGui:
             "Enter\tFetch info for the URL in the box\n"
             "Ctrl+Enter\tAdd to the queue\n"
             "Ctrl+M\tAdd many URLs at once\n"
-            "Ctrl+T\tScan browser tabs for video and audio\n"
+            "Ctrl+T\tQueue every video and audio tab open in your browsers\n"
+            "Ctrl+Shift+T\tChoose which browser tabs to queue\n"
             "Ctrl+A\tSelect every queue item\n"
             "Ctrl+O\tChoose the download folder\n"
             "Delete\tRemove the selected queue items\n"
@@ -2558,6 +2744,7 @@ class YtdlpGui:
             pass
         save_config(self.cfg)
         self._save_queue()
+        self.bridge.stop()
         self.root.destroy()
 
 
@@ -2624,7 +2811,7 @@ class _BulkDialog:
             pass
 
     def close(self):
-        for attr in ("scan_dialog", "batch_dialog"):
+        for attr in ("scan_dialog", "batch_dialog", "extension_dialog"):
             if getattr(self.app, attr) is self:
                 setattr(self.app, attr, None)
         try:
@@ -2733,9 +2920,14 @@ class TabScanDialog(_BulkDialog):
         self.rescan_button.config(state=tk.DISABLED)
         include_closed = self.include_closed_var.get()
 
+        def waiting(names):
+            self.app._after(self.detail_var.set,
+                            f"Waiting for the browser extension in {join_names(names)} "
+                            "to report its tabs (it does so every 30 seconds)...")
+
         def work():
             try:
-                results = tabscan.scan_browsers(include_closed=include_closed)
+                results = self.app.gather_tabs(include_closed, waiting)
                 error = ""
             except Exception as exc:  # never leave the window spinning
                 results, error = [], str(exc)
@@ -2752,6 +2944,7 @@ class TabScanDialog(_BulkDialog):
         self.results = results
         if error:
             self.app.log(f"Tab scan failed: {error}", "error")
+        self.app.remember_extension_browsers(results)
         self._populate()
 
     def _populate(self):
@@ -2843,9 +3036,9 @@ class TabScanDialog(_BulkDialog):
             if r.history_hours:
                 parts.append(f"{r.source}: open tabs are locked by the browser - showing {count} "
                              f"video pages from the last {r.history_hours} hours of history "
-                             "(not ticked)")
+                             "(not ticked). Tools > Set up browser extension fixes this")
                 continue
-            state = "" if r.running else ", closed"
+            state = ", live" if r.via_extension else ("" if r.running else ", closed")
             parts.append(f"{r.source}: {len(r.tabs)} tabs, {count} media{state}")
         self.detail_var.set("   ·   ".join(parts))
 
@@ -2928,6 +3121,109 @@ class TabScanDialog(_BulkDialog):
             entries, self.kind_var.get(), self.quality_var.get(), source="browser tabs")
         if added or skipped:
             self.close()
+
+
+class ExtensionDialog(_BulkDialog):
+    """How to install the companion extension, with a live 'is it working' line per browser."""
+
+    def __init__(self, app: YtdlpGui):
+        super().__init__(app, "Set up the browser extension", (660, 400))
+        self.status_vars: dict[str, tk.StringVar] = {}
+        folder = str(EXTENSION_DIR)
+
+        ttk.Label(self.body, text="Let the app see your open tabs", style="Title.TLabel").pack(
+            anchor=tk.W)
+        intro = ttk.Label(
+            self.body, justify=tk.LEFT, wraplength=580,
+            text="Chrome, Brave and Edge lock their list of open tabs while they run. This "
+                 "small extension tells the app which tabs are open instead. It only talks to "
+                 "this app, on this computer. Do this once in each browser:")
+        intro.pack(anchor=tk.W, pady=(6, 8))
+        # Browsers refuse to open their own chrome:// pages when another program
+        # asks, so the address is put on the clipboard for the user to paste.
+        steps = ttk.Label(
+            self.body, justify=tk.LEFT, wraplength=580,
+            text="1.  Click 'Open' for the browser below. It opens a new window and copies "
+                 "the address of its extensions page: paste it in the address bar and "
+                 "press Enter.\n"
+                 "2.  Switch on 'Developer mode' (top right of that page).\n"
+                 "3.  Click 'Copy' next to the folder here, then 'Load unpacked' in the "
+                 "browser. Paste the folder path into the folder box and press "
+                 "'Select Folder'.\n"
+                 "4.  The browser's line below turns to 'working' within a few seconds.")
+        steps.pack(anchor=tk.W)
+
+        path_row = ttk.Frame(self.body)
+        path_row.pack(fill=tk.X, pady=(10, 4))
+        ttk.Label(path_row, text="Folder:").pack(side=tk.LEFT)
+        entry = ttk.Entry(path_row)
+        entry.insert(0, folder)
+        entry.config(state="readonly")
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(path_row, text="Copy", width=7, command=self.copy_path).pack(side=tk.LEFT)
+        ttk.Button(path_row, text="Open", width=7,
+                   command=lambda: open_in_explorer(folder)).pack(side=tk.LEFT, padx=(4, 0))
+
+        table = ttk.Frame(self.body)
+        table.pack(fill=tk.X, pady=(10, 0))
+        table.columnconfigure(1, weight=1)
+        for row, (name, exe, page) in enumerate(EXTENSION_BROWSERS):
+            path = find_browser_exe(exe)
+            var = tk.StringVar()
+            self.status_vars[name] = var
+            ttk.Label(table, text=name, style="Title.TLabel", width=8).grid(
+                row=row, column=0, sticky=tk.W, pady=3)
+            ttk.Label(table, textvariable=var).grid(row=row, column=1, sticky=tk.W, padx=8)
+            button = ttk.Button(table, text=f"Open {name}",
+                                command=lambda p=path, u=page: self.open_page(p, u))
+            button.grid(row=row, column=2, sticky=tk.E)
+            if not path:
+                button.config(state=tk.DISABLED)
+                var.set("not installed on this computer")
+
+        if not app.bridge.listening:
+            ttk.Label(self.body, foreground="#c0392b", wraplength=580, justify=tk.LEFT,
+                      text=f"The app cannot listen for the extension: {app.bridge.error}").pack(
+                anchor=tk.W, pady=(10, 0))
+
+        bottom = ttk.Frame(self.body)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(bottom, text="Close", width=9, command=self.close).pack(side=tk.RIGHT)
+
+        self.apply_theme()
+        self.refresh()
+
+    def copy_path(self):
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(str(EXTENSION_DIR))
+        self.app.set_status("Extension folder path copied to the clipboard.")
+
+    def open_page(self, exe: str | None, page: str):
+        if not exe:
+            return
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(page)
+        try:
+            subprocess.Popen([exe, "--new-window"])
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Could not start the browser: {exc}", parent=self.top)
+            return
+        self.app.set_status(f"Copied {page} - paste it in the browser's address bar.")
+
+    def refresh(self):
+        if not self.top.winfo_exists():
+            return
+        counts: dict[str, int] = {}
+        for snap in self.app.bridge.snapshots():
+            counts[snap.browser] = counts.get(snap.browser, 0) + len(snap.tabs)
+        for name, var in self.status_vars.items():
+            if var.get() == "not installed on this computer":
+                continue
+            if name in counts:
+                var.set(f"working - {counts[name]} open tab{'s' if counts[name] != 1 else ''}")
+            else:
+                var.set("not set up yet (or the browser is closed)")
+        self.top.after(1500, self.refresh)
 
 
 class BatchDialog(_BulkDialog):
