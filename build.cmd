@@ -2,7 +2,8 @@
 rem Rebuild the app as a single .exe in dist\.
 rem Double-click it, or run it from a terminal in this folder.
 rem   build.cmd            pull the latest code, test, build the current version
-rem   build.cmd 2.0        build an older release (any git tag, e.g. v2.0) - see "git tag"
+rem   build.cmd 2.0        build an older release: a git tag such as v2.0, or a commit id
+rem                        (2.0 is commit 450382c - "build.cmd 450382c" works without the tag)
 rem   build.cmd nopause    do not wait for a key at the end (combines with a version)
 rem   set YTDLP_NO_PULL=1  build without pulling first (for testing local changes)
 rem
@@ -47,6 +48,8 @@ for %%A in (%*) do (
         set "WANT=%%~A"
     )
 )
+rem    "2.0" means the tag v2.0; a commit id such as 450382c works too
+set "WANT_RAW=%WANT%"
 if defined WANT if /i not "%WANT:~0,1%"=="v" set "WANT=v%WANT%"
 
 rem -- Python: the py launcher picks 3.13 if it is installed, else plain python
@@ -109,6 +112,8 @@ rem   copy of resources\), built there into this folder's dist\, and the temp
 rem   folder is removed again. Your checkout is not touched.
 :build_release
 git fetch --tags --quiet >nul 2>&1
+git rev-parse --verify --quiet "%WANT%^{commit}" >nul
+if errorlevel 1 set "WANT=%WANT_RAW%"
 git rev-parse --verify --quiet "%WANT%^{commit}" >nul
 if errorlevel 1 (
     echo There is no version %WANT%. Versions you can build:
